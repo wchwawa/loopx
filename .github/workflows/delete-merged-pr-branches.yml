@@ -1,0 +1,108 @@
+name: Delete Merged PR Branches
+
+on:
+  pull_request_target:
+    types:
+      - closed
+
+permissions: {}
+
+concurrency:
+  group: delete-merged-pr-branch-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  delete-merged-pr-branch:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Delete merged head branch
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const pull = context.payload.pull_request;
+            const repository = context.payload.repository;
+            const { owner, repo } = context.repo;
+            const headRef = pull.head.ref;
+
+            const readBranch = async () => {
+              try {
+                const response = await github.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: headRef,
+                });
+                return response.data;
+              } catch (error) {
+                if (error.status === 404) {
+                  return null;
+                }
+                throw error;
+              }
+            };
+
+            const { data: openPulls } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: "open",
+              head: `${owner}:${headRef}`,
+              per_page: 1,
+            });
+            if (openPulls.length !== 0) {
+              core.notice(`Keeping branch "${headRef}" because another open pull request uses it.`);
+              return;
+            }
+
+            const zeroOid = "0000000000000000000000000000000000000000";
+            try {
+              await github.graphql(
+                `mutation(
+                  $repositoryId: ID!
+                  $name: GitRefname!
+                  $beforeOid: GitObjectID!
+                  $afterOid: GitObjectID!
+                ) {
+                  updateRefs(input: {
+                    repositoryId: $repositoryId
+                    refUpdates: [{
+                      name: $name
+                      beforeOid: $beforeOid
+                      afterOid: $afterOid
+                    }]
+                  }) {
+                    clientMutationId
+                  }
+                }`,
+                {
+                  repositoryId: repository.node_id,
+                  name: `refs/heads/${headRef}`,
+                  beforeOid: pull.head.sha,
+                  afterOid: zeroOid,
+                },
+              );
+            } catch (error) {
+              const latestBranch = await readBranch();
+              if (latestBranch === null) {
+                core.notice(`Branch "${headRef}" was deleted concurrently.`);
+                return;
+              }
+              if (latestBranch.commit.sha !== pull.head.sha) {
+                core.notice(`Keeping branch "${headRef}" because it moved during cleanup.`);
+                return;
+              }
+              if (latestBranch.protected) {
+                core.notice(`Keeping branch "${headRef}" because it became protected.`);
+                return;
+              }
+              throw error;
+            }
+
+            core.info(`Deleted merged branch "${headRef}".`);
