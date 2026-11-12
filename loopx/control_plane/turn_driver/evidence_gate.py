@@ -27,8 +27,12 @@ _PROFILE_FIELDS = {"unit": "value", "comparison_scope": "turn", "input_revision"
 class GatePolicy:
     """Thresholds a caller may tune; defaults favour uninterrupted work."""
 
+    # A run is stalled when its last `plateau_results` authoritative results
+    # added less than `min_gain_share` of everything it has gained so far.
+    # Counting only strict new bests misses a run that keeps adding marginal
+    # gains inside one approach while a different approach has far more room.
     plateau_results: int = 3
-    relative_epsilon: float = 0.0
+    min_gain_share: float = 0.05
     idle_returns: int = 2
     idle_seconds: float = 120.0
     final_reserve_seconds: float = 180.0
@@ -37,10 +41,12 @@ class GatePolicy:
     def __post_init__(self) -> None:
         if self.plateau_results < 2 or self.idle_returns < 2:
             raise ValueError("gate windows need at least two observations")
-        for value in (self.relative_epsilon, self.idle_seconds, self.final_reserve_seconds,
+        for value in (self.min_gain_share, self.idle_seconds, self.final_reserve_seconds,
                       self.min_consult_remaining_seconds):
             if not math.isfinite(value) or value < 0:
                 raise ValueError("gate thresholds must be finite and non-negative")
+        if self.min_gain_share >= 1:
+            raise ValueError("the stalled-gain share must be below one")
 
 
 @dataclass(frozen=True)
@@ -76,30 +82,34 @@ def normalize_evidence(payload: Any) -> dict[str, Any]:
     return {"higher_is_better": direction, "measurements": measurements}
 
 
-def _improves(value: float, best: float | None, *, higher: bool, epsilon: float) -> bool:
-    if best is None:
-        return True
-    gain = value - best if higher else best - value
-    return gain > epsilon * abs(best)
+def summarize_authoritative(evidence: Mapping[str, Any], *, window: int = 3) -> dict[str, Any]:
+    """Incumbent, and how much of the run's total gain its last `window` results added.
 
-
-def summarize_authoritative(evidence: Mapping[str, Any], *, epsilon: float = 0.0) -> dict[str, Any]:
-    """Incumbent and how many authoritative results arrived since it was set."""
+    ``recent_gain_share`` is None until `window` results follow the first valid
+    one. It is 0.0 for a flat run and 1.0 when all the gain is recent.
+    """
     higher = evidence["higher_is_better"]
     rows = [row for row in evidence["measurements"] if row["authoritative"]]
     best: dict[str, Any] | None = None
-    since_best = 0
+    first: float | None = None
+    since_best, incumbents = 0, []
     for row in rows:
         scored = row["valid"] and row["value"] is not None
-        if scored and _improves(row["value"], None if best is None else best["value"],
-                                higher=higher, epsilon=epsilon):
+        if scored and (best is None or (row["value"] > best["value"] if higher else row["value"] < best["value"])):
             best, since_best = row, 0
+            first = row["value"] if first is None else first
         else:
             since_best += 1
+        incumbents.append(None if best is None else best["value"])
+    share = None
+    if best is not None and len(incumbents) > window and incumbents[-window - 1] is not None:
+        total = abs(best["value"] - first)
+        share = 0.0 if total == 0 else abs(best["value"] - incumbents[-window - 1]) / total
     return {
         "count": len(rows),
         "best": None if best is None else {key: best[key] for key in ("candidate_ref", "value", "sequence")},
         "results_since_best": since_best,
+        "recent_gain_share": None if share is None else round(share, 4),
         "recent": [{key: row[key] for key in ("candidate_ref", "value", "valid", "sequence")}
                    for row in rows[-_DIGEST_RESULTS:]],
     }
@@ -110,7 +120,8 @@ def fidelity_request(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     rows = evidence["measurements"]
     paired = ({row["candidate_ref"] for row in rows if row["authoritative"]}
               & {row["candidate_ref"] for row in rows if not row["authoritative"]})
-    if len(paired) < 3:
+    # Three points give three ordered pairs: one noisy comparison flips the sign.
+    if len(paired) < 4:
         return None
 
     def profile(kind: str) -> dict[str, Any]:
@@ -164,20 +175,22 @@ def decide(
         return GateDecision("consult", "every_return", facts)
     summary = None
     if evidence is not None:
-        summary = summarize_authoritative(evidence, epsilon=policy.relative_epsilon)
+        summary = summarize_authoritative(evidence, window=policy.plateau_results)
         facts["authoritative"] = summary
     if mode == "never" or remaining_seconds < policy.min_consult_remaining_seconds:
         return GateDecision("continue", "no_consult_window" if mode != "never" else "gate_disabled", facts)
 
     if summary is not None:
-        best_sequence = None if summary["best"] is None else summary["best"]["sequence"]
-        if state.get("plateau_best_sequence") != best_sequence:
-            state["plateau_best_sequence"], state["plateau_consulted_at"] = best_sequence, 0
-        stalled = summary["results_since_best"]
-        if stalled - state.get("plateau_consulted_at", 0) >= policy.plateau_results:
-            state["plateau_consulted_at"] = stalled
+        # Wait for a full window of new results before asking about the same stall again.
+        fresh = summary["count"] - state.get("stall_consulted_count", 0) >= policy.plateau_results
+        share = summary["recent_gain_share"]
+        if summary["best"] is None:
             # With no incumbent at all, every authoritative attempt so far failed.
-            reason = "authoritative_plateau" if summary["best"] is not None else "no_valid_authoritative_result"
+            stalled, reason = summary["count"] >= policy.plateau_results, "no_valid_authoritative_result"
+        else:
+            stalled, reason = share is not None and share < policy.min_gain_share, "authoritative_plateau"
+        if stalled and fresh:
+            state["stall_consulted_count"] = summary["count"]
             return GateDecision("consult", reason, facts)
         reversed_proxy = _reversed_fidelity(evidence, evaluate_fidelity)  # type: ignore[arg-type]
         if reversed_proxy is not None and state.get("fidelity_consulted") != reversed_proxy:

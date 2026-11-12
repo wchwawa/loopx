@@ -219,7 +219,8 @@ runs under the trial's own grant so it can call `sforge-submit`, and is resumed
 on the same session after each return. Between returns the Host reads the
 solver-visible submission history (`benchmark/runtime/native_evidence.py`, no
 model call and no evaluation slot). `evidence` consults the Controller only
-when completed native results stop improving or the Worker returns idle;
+when the last three completed native results add under 5% of the gain so far,
+every native attempt has failed, or the Worker returns idle;
 `never` consults it once for the Turn receipt and isolates the effect of the
 continuous Worker. These modes need no nested sandbox in the guest. Both roles
 then share the task container's boundary, and the Controller is read-only by

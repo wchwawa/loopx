@@ -44,6 +44,25 @@ def test_plateau_consults_once_until_more_results_arrive():
     assert decide(snapshot([5.0, 4.0, 5.0, None, 4.5, 4.6, 4.7, 9.0, 1.0, 1.0, 1.0]), state).action == "consult"
 
 
+def test_marginal_gains_inside_one_approach_count_as_a_stall():
+    # Every result is a strict new best, yet the last three add under 5% of the gain so far.
+    creeping = [10.0, 20.0, 30.0, 30.2, 30.3, 30.4]
+    state = {}
+    for upto in range(1, 6):
+        assert decide(snapshot(creeping[:upto]), state).action == "continue"
+    stalled = decide(snapshot(creeping), state)
+    assert (stalled.action, stalled.reason) == ("consult", "authoritative_plateau")
+    assert stalled.facts["authoritative"]["results_since_best"] == 0
+    assert stalled.facts["authoritative"]["recent_gain_share"] == pytest.approx(0.4 / 20.4, abs=1e-4)
+    # A run that still converts results into comparable gains is left alone.
+    climbing = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+    state = {}
+    assert {decide(snapshot(climbing[:upto]), state).action for upto in range(1, 9)} == {"continue"}
+    # The share needs a full window of results after the first valid one.
+    assert gate.summarize_authoritative(snapshot([10.0, 10.0, 10.0]))["recent_gain_share"] is None
+    assert gate.summarize_authoritative(snapshot([10.0, 10.0, 10.0, 10.0]))["recent_gain_share"] == 0.0
+
+
 def test_lower_is_better_direction_and_no_valid_incumbent():
     state = {}
     assert decide(snapshot([None, None]), state).action == "continue"
@@ -87,7 +106,8 @@ def test_reversed_proxy_reuses_the_shared_fidelity_operator():
     request = gate.fidelity_request(evidence)
     assert request["authoritative"]["metric"] == "authoritative" and request["proxy"]["metric"] == "proxy"
     assert {m["candidate_ref"] for f in request["findings"] for m in f["measurements"]} == {"c0", "c1", "c2", "c3"}
-    assert gate.fidelity_request(snapshot([1.0, 2.0], proxies=proxies[:2])) is None
+    # Three pairs give three comparisons; one noisy one would flip the verdict.
+    assert gate.fidelity_request(snapshot([1.0, 2.0, 3.0], proxies=proxies[:3])) is None
 
     calls = []
 

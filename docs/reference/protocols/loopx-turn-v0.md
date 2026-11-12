@@ -156,11 +156,13 @@ return the Host resumes the same Worker thread with a one-line continuation
 unless the gate asks for a consult. A deterministic rule set decides this
 without a model call. It consults the Controller when:
 
-- several authoritative results arrived without a new best
-  (`authoritative_plateau`), or every authoritative attempt so far failed
-  (`no_valid_authoritative_result`);
-- a proxy measure ranks candidates against the authoritative one, using the
-  shared scoped-fidelity operator (`proxy_order_reversed`);
+- the last three authoritative results added less than 5% of the gain achieved
+  since the first valid one (`authoritative_plateau`). Marginal new bests inside
+  one approach count as a stall, so a run that creeps upward is still caught;
+- every authoritative attempt so far failed (`no_valid_authoritative_result`);
+- a proxy measure ranks at least four paired candidates against the
+  authoritative one, using the shared scoped-fidelity operator
+  (`proxy_order_reversed`);
 - the Worker returned quickly twice with no new measurement (`worker_idle`).
 
 Each trigger fires once per piece of new evidence, so a standing plateau does

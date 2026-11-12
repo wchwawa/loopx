@@ -1179,8 +1179,9 @@ measured outside the conversation:
 - **Gate.** After each return the Host reads a caller-supplied
   `turn_worker_evidence_v0` snapshot and decides without a model call. Ordinary
   returns cost no Controller tokens. A consult fires on an authoritative
-  plateau, a run of failed authoritative results with no incumbent, a proxy
-  that ranks against the authoritative measure (through the
+  plateau (recent results adding under 5% of the gain so far, so marginal new
+  bests still count), a run of failed authoritative results with no incumbent,
+  a proxy that ranks against the authoritative measure (through the
   shared scoped-fidelity operator), or an idle Worker, once per piece of new
   evidence.
 - **Controller.** On a consult it receives the contract, the measured facts and

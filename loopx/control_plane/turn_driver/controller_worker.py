@@ -474,8 +474,10 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
             if not isinstance(result, dict):
                 raise ValueError("controller returned an invalid result")
             return normalize_codex_result(request, result)
-        brief.append('Set instruction to a concrete redirection for the Worker, or to "continue" when the '
-                     "current direction should proceed unchanged. The work continues until the Turn deadline.")
+        brief.append("Judge from the measurements and the workspace whether the Worker is still refining an "
+                     "approach whose measured gains have stalled. If a different approach clearly has more "
+                     'room, set instruction to that redirection, concretely. Otherwise set instruction to '
+                     '"continue". The work continues until the Turn deadline.')
         # A consult advises the Worker; it never ends the work early and its
         # own failure never costs the Worker its session.
         instruction = CONTINUE_INSTRUCTION
