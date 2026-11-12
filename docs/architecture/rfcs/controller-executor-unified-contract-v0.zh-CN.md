@@ -942,9 +942,10 @@ Worker 返回后都调用 Controller，并把 Worker 限制到无法访问外部
   模型就做出判断。普通返回不消耗 Controller token。权威结果进入平台期、代理标尺与权威
   指标排序相反（复用共用的 scoped-fidelity 算子）或 Worker 空转时触发咨询，同一份新证据
   只触发一次。
-- **Controller。** 被咨询时收到契约、测量事实和最新报告，回答改向指令、`continue` 或
-  类型化结果。到达截止预留时由它产出 Core 回执。`never` 只保留这最后一轮，用来把
-  "Worker 连续工作"的效果与"Controller 判断"的效果分开。
+- **Controller。** 被咨询时收到契约、测量事实和最新报告，回答改向指令或 `continue`。
+  咨询不能提前结束本轮 Turn，咨询失败时 Worker 保持原方向和原会话。到达截止预留时由它
+  产出 Core 回执。`never` 只保留这最后一轮，用来把"Worker 连续工作"的效果与
+  "Controller 判断"的效果分开。
 
 每次判断连同原因和事实记录在各角色用量旁。默认的 `every-return` 行为、已准入配置的身份
 和恢复方式不变。本检查点用真实 Codex CLI、受控推理后端和 SQLite 权威存储运行，不证明

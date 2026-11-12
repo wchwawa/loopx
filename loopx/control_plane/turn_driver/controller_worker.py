@@ -409,9 +409,7 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
     the gate; the deadline reserve asks it for the typed Core result.
     """
     controller_prompt, result_schema = prepare_codex_controller_input(request)
-    nullable_result = {"anyOf": [result_schema, {"type": "null"}]}
-    consult_schema = object_schema({"instruction": {"type": ["string", "null"]}, "result": nullable_result})
-    settle_schema = object_schema({"instruction": {"type": "null"}, "result": result_schema})
+    consult_schema = object_schema({"instruction": {"type": "string"}})
     policy = gate_policy_for(host.timeout)
     returns = trail.setdefault("worker_returns", [])
     decisions = trail.setdefault("gate_decisions", [])
@@ -470,22 +468,30 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
                   "Latest Worker report:\n" + json.dumps(report, ensure_ascii=False)]
         if host.role_isolation == "caller":
             brief.append("Inspect the workspace read-only. The Worker owns every file change.")
-        if not settle:
-            brief.append('Set instruction to a concrete redirection for the Worker, set instruction to "continue" '
-                         "when the current direction should proceed unchanged, or set result to settle the Turn.")
-        if not briefed:
+        if settle:
             brief.append("For your Core receipt:\n" + "\n".join(codex_receipt_instructions()))
-        briefed = True
-        reply = native.send("controller", "\n".join(brief), settle_schema if settle else consult_schema)
-        direction, result = reply.get("instruction"), reply.get("result")
-        if result is not None:
-            if direction is not None or not isinstance(result, dict):
-                raise ValueError("controller returned ambiguous decision")
+            result = native.send("controller", "\n".join(brief), result_schema)
+            if not isinstance(result, dict):
+                raise ValueError("controller returned an invalid result")
             return normalize_codex_result(request, result)
-        if settle or not isinstance(direction, str) or not direction.strip() or len(direction) > 16000:
-            raise ValueError("controller returned an invalid task")
-        decisions[-1]["controller_redirected"] = direction.strip().lower() != "continue"
-        instruction = direction if decisions[-1]["controller_redirected"] else CONTINUE_INSTRUCTION
+        brief.append('Set instruction to a concrete redirection for the Worker, or to "continue" when the '
+                     "current direction should proceed unchanged. The work continues until the Turn deadline.")
+        # A consult advises the Worker; it never ends the work early and its
+        # own failure never costs the Worker its session.
+        instruction = CONTINUE_INSTRUCTION
+        try:
+            direction = native.send("controller", "\n".join(brief), consult_schema).get("instruction")
+            briefed = True
+        except (RuntimeError, ValueError):
+            decisions[-1]["controller_outcome"] = "failed"
+            continue
+        if not isinstance(direction, str) or not direction.strip() or len(direction) > 16000:
+            decisions[-1]["controller_outcome"] = "invalid"
+        elif direction.strip().lower() == "continue":
+            decisions[-1]["controller_outcome"] = "continued"
+        else:
+            decisions[-1]["controller_outcome"] = "redirected"
+            instruction = direction
 
 
 @contextmanager

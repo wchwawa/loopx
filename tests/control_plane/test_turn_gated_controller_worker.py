@@ -41,7 +41,10 @@ class Transport:
         if role == "controller":
             self.controller_prompts.append(prompt)
             self.schemas.append(schema)
-            return next(self.controller)
+            reply = next(self.controller)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
         budget = self.remaining() - reserve
         if budget <= 0:
             return None
@@ -81,8 +84,7 @@ def test_worker_advances_without_controller_until_results_stop_improving(tmp_pat
     scores = [1.0, 2.0, 3.0, 3.0, 2.5, 2.9, 4.0, 5.0]
     snapshots = [(evidence_of(scores[:n]), None) for n in range(1, len(scores) + 1)]
     native = Transport(budget=10_000, turn_seconds=1_000, controller=[
-        {"instruction": "Replace the greedy pass with beam search.", "result": None},
-        {"instruction": None, "result": RECEIPT}])
+        {"instruction": "Replace the greedy pass with beam search."}, RECEIPT])
     result, trail = run(native, tmp_path, mode="evidence", snapshots=snapshots)
 
     assert result == RECEIPT
@@ -95,22 +97,25 @@ def test_worker_advances_without_controller_until_results_stop_improving(tmp_pat
     assert len(native.controller_prompts) == 2
     consult, settle = native.controller_prompts
     assert consult.startswith("C1 CONTRACT") and TASK in consult and "Trigger: authoritative_plateau" in consult
-    assert '"results_since_best": 3' in consult and "For your Core receipt:" in consult
+    assert '"results_since_best": 3' in consult and "For your Core receipt:" not in consult
     assert "C1 CONTRACT" not in settle and "Trigger: deadline_reserve" in settle
-    assert native.schemas[1]["properties"]["instruction"] == {"type": "null"}
+    assert "For your Core receipt:" in settle
+    # A consult can only advise; only the deadline reserve asks for the typed result.
+    assert native.schemas[0]["required"] == ["instruction"] and native.schemas[1] == {"type": "object"}
     assert [(d["action"], d["reason"]) for d in trail["gate_decisions"]] == [
         *[("continue", "no_decision_relevant_evidence")] * 5, ("consult", "authoritative_plateau"),
         *[("continue", "no_decision_relevant_evidence")] * 3, ("finalize", "deadline_reserve")]
-    assert trail["gate_decisions"][5]["controller_redirected"] is True
+    assert trail["gate_decisions"][5]["controller_outcome"] == "redirected"
     assert [r["outcome"] for r in trail["worker_returns"]][-1] == "reserve_reached"
 
 
 def test_never_mode_spends_one_controller_turn_for_the_receipt(tmp_path):
     flat = [(evidence_of([5.0] + [1.0] * n), None) for n in range(12)]
-    native = Transport(budget=5_000, turn_seconds=700, controller=[{"instruction": None, "result": RECEIPT}])
+    native = Transport(budget=5_000, turn_seconds=700, controller=[RECEIPT])
     result, trail = run(native, tmp_path, mode="never", snapshots=flat, timeout=5_000.0)
     assert result == RECEIPT and len(native.controller_prompts) == 1
     assert native.controller_prompts[0].startswith("C1 CONTRACT")
+    assert "For your Core receipt:" in native.controller_prompts[0]
     assert {d["reason"] for d in trail["gate_decisions"][:-1]} == {"gate_disabled"}
     assert native.worker_prompts == [TASK] + [roles.CONTINUE_INSTRUCTION] * (len(native.worker_prompts) - 1)
 
@@ -118,17 +123,33 @@ def test_never_mode_spends_one_controller_turn_for_the_receipt(tmp_path):
 def test_controller_may_let_the_worker_proceed_unchanged(tmp_path):
     flat = [(evidence_of([5.0, 1.0, 1.0][:n] + [1.0] * max(0, n - 3)), None) for n in range(1, 9)]
     native = Transport(budget=10_000, turn_seconds=1_500, controller=[
-        {"instruction": "continue", "result": None}, {"instruction": None, "result": RECEIPT}])
+        {"instruction": "continue"}, RECEIPT])
     _, trail = run(native, tmp_path, mode="evidence", snapshots=flat)
     consult = next(d for d in trail["gate_decisions"] if d["action"] == "consult")
-    assert consult["controller_redirected"] is False
+    assert consult["controller_outcome"] == "continued"
     assert set(native.worker_prompts[1:]) == {roles.CONTINUE_INSTRUCTION}
+
+
+def test_a_failed_or_empty_consult_never_costs_the_worker_its_session(tmp_path):
+    scores = [5.0] + [1.0] * 12
+    snapshots = [(evidence_of(scores[:n]), None) for n in range(1, 10)]
+    native = Transport(budget=10_000, turn_seconds=1_000, controller=[
+        RuntimeError("native role Turn did not complete"), {"instruction": "  "}, RECEIPT])
+    result, trail = run(native, tmp_path, mode="evidence", snapshots=snapshots)
+    assert result == RECEIPT
+    outcomes = [d.get("controller_outcome") for d in trail["gate_decisions"] if d["action"] == "consult"]
+    assert outcomes == ["failed", "invalid"]
+    # The Worker kept its one thread and its own direction throughout.
+    assert native.worker_prompts == [TASK] + [roles.CONTINUE_INSTRUCTION] * (len(native.worker_prompts) - 1)
+    # A consult that failed before delivery re-sends the contract on the next one.
+    assert all(prompt.startswith("C1 CONTRACT") for prompt in native.controller_prompts[:2])
+    assert not native.controller_prompts[2].startswith("C1 CONTRACT")
 
 
 def test_transient_worker_failure_resumes_the_same_thread(tmp_path):
     sleeps = []
     native = Transport(budget=10_000, turn_seconds=2_000, fail_worker_calls={2, 3},
-                       controller=[{"instruction": None, "result": RECEIPT}])
+                       controller=[RECEIPT])
     result, trail = run(native, tmp_path, mode="never", snapshots=[], sleeps=sleeps)
     assert result == RECEIPT and sleeps == list(roles._WORKER_RETRY_BACKOFF_SECONDS[:2])
     assert [r["outcome"] for r in trail["worker_returns"]][:3] == ["returned", "retried_after_failure",
@@ -147,8 +168,8 @@ def test_transient_worker_failure_resumes_the_same_thread(tmp_path):
 
 
 def test_settlement_requires_a_typed_result(tmp_path):
-    native = Transport(budget=1_000, turn_seconds=2_000, controller=[{"instruction": "keep going", "result": None}])
-    with pytest.raises(ValueError, match="invalid task"):
+    native = Transport(budget=1_000, turn_seconds=2_000, controller=[["not", "a", "result"]])
+    with pytest.raises(ValueError, match="invalid result"):
         run(native, tmp_path, mode="never", snapshots=[], timeout=1_000.0)
 
 
@@ -233,35 +254,40 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
         "         'authoritative': True, 'sequence': i} for i in range(1 + 3 * n)]\n"
         "print(json.dumps({'schema_version': 'turn_worker_evidence_v0', 'higher_is_better': True,\n"
         "                  'measurements': rows}))\n")
-    inputs, key = [], None
+    worker_inputs, controller_inputs, key = [], [], None
 
     def respond(request, index, message):
         nonlocal key
-        text = [part["text"] for item in request["input"] if item.get("role") == "user"
-                for part in item["content"] if "text" in part][-1]
-        if index in (1, 4):
-            inputs.append(text)
-            command = "cat observation" if index == 1 else (
-                "tr -d '\\n' > " + marker + " <<EOF\n$(cat observation)\nEOF")
-            return {"type": "function_call", "id": f"fc_{index}", "call_id": f"call_{index}",
-                    "name": "exec_command", "arguments": json.dumps({"cmd": command})}
-        if index == 2:
-            answer = {"finding": "Observed " + expected, "artifacts": []}
-        elif index == 3:
-            inputs.append(text)
-            key = json.JSONDecoder().raw_decode(text.split("Turn request:\n", 1)[1])[0]["turn_key"]
-            answer = {"instruction": "Copy the checked observation into the output file.", "result": None}
-        elif index == 5:
-            answer = {"finding": "Written", "artifacts": [marker]}
+        last = request["input"][-1]
+        if last.get("type") == "function_call_output":
+            wrote = (project / marker).exists()
+            answer = {"finding": "Written" if wrote else "Observed " + expected,
+                      "artifacts": [marker] if wrote else []}
         else:
-            inputs.append(text)
-            answer = {"instruction": None, "result": {
-                "schema_version": "loopx_turn_result_v0", "turn_key": key, "result_kind": "validated_progress",
-                "completed_phases": ["host_execute", "typed_result"], "classification": "fixture_progress",
-                "recommended_action": "Check the output.", "next_action": "Continue the work.",
-                "delivery_batch_scale": "single_surface", "delivery_outcome": "outcome_progress",
-                "vision_unchanged_reason": "The objective is unchanged.", "summary": "Updated the artifact.",
-                "work_evidence": ["artifact:marker"], "validation_evidence": ["check:marker-readback"]}}
+            text = [part["text"] for item in request["input"] if item.get("role") == "user"
+                    for part in item["content"] if "text" in part][-1]
+            if "Trigger: " in text:
+                controller_inputs.append(text)
+                if "Turn request:\n" in text:
+                    key = json.JSONDecoder().raw_decode(text.split("Turn request:\n", 1)[1])[0]["turn_key"]
+                if "Trigger: deadline_reserve" not in text:
+                    answer = {"instruction": "Copy the checked observation into the output file."}
+                else:
+                    answer = {
+                        "schema_version": "loopx_turn_result_v0", "turn_key": key,
+                        "result_kind": "validated_progress",
+                        "completed_phases": ["host_execute", "typed_result"], "classification": "fixture_progress",
+                        "recommended_action": "Check the output.", "next_action": "Continue the work.",
+                        "delivery_batch_scale": "single_surface", "delivery_outcome": "outcome_progress",
+                        "vision_unchanged_reason": "The objective is unchanged.",
+                        "summary": "Updated the artifact.", "work_evidence": ["artifact:marker"],
+                        "validation_evidence": ["check:marker-readback"]}
+            else:
+                worker_inputs.append(text)
+                command = ("tr -d '\\n' > " + marker + " <<EOF\n$(cat observation)\nEOF"
+                           if text.startswith("Copy the checked") else "cat observation; sleep 2")
+                return {"type": "function_call", "id": f"fc_{index}", "call_id": f"call_{index}",
+                        "name": "exec_command", "arguments": json.dumps({"cmd": command})}
         message["content"][0]["text"] = json.dumps(answer)
         return message
 
@@ -287,7 +313,7 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
                "--goal-id", goal, "--agent-id", agent, "--project", str(project),
                "--host", "codex-cli", "--execution-mode", "isolated-headless", "--topology", "controller-worker",
                "--scheduler-owner", "outer_controller", "--prepare-selected-todo",
-               "--turn-instance-id", "gated-roles", "--timeout-seconds", "120", "--codex-bin", str(wrapper),
+               "--turn-instance-id", "gated-roles", "--timeout-seconds", "60", "--codex-bin", str(wrapper),
                "--task-material", str(task), "--codex-sandbox", "workspace-write",
                "--controller-gate", "evidence", "--role-isolation", "caller",
                "--evidence-command-json", json.dumps([sys.executable, str(evidence)]),
@@ -304,18 +330,29 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
         assert held.returncode != 0 and "original Turn topology" in held.stdout + held.stderr
 
     # The Worker received the caller's task first, verbatim, with no Controller turn before it.
-    assert inputs[0] == TASK and inputs[2] == "Copy the checked observation into the output file."
-    assert "Trigger: authoritative_plateau" in inputs[1] and "For your Core receipt:" in inputs[1]
-    assert "Trigger: authoritative_plateau" in inputs[3] and "Turn request:" not in inputs[3]
+    assert worker_inputs[0] == TASK
+    assert worker_inputs[1] == "Copy the checked observation into the output file."
+    assert set(worker_inputs[2:]) <= {roles.CONTINUE_INSTRUCTION,
+                                      "Copy the checked observation into the output file."}
+    assert "Trigger: authoritative_plateau" in controller_inputs[0] and "Turn request:" in controller_inputs[0]
+    assert "For your Core receipt:" not in controller_inputs[0]
+    assert all("Turn request:" not in text for text in controller_inputs[1:])
+    assert "Trigger: deadline_reserve" in controller_inputs[-1] and "For your Core receipt:" in controller_inputs[-1]
     assert (project / marker).read_text() == expected
     record, = (runtime / "goals" / goal / "turns/controller-worker").glob("*.json")
     journal = json.loads(record.read_text())
-    assert [step["role"] for step in journal["steps"]] == ["worker", "controller", "worker", "controller"]
-    assert [(d["action"], d["reason"]) for d in journal["gate_decisions"]] == [
-        ("consult", "authoritative_plateau")] * 2
-    assert journal["gate_decisions"][0]["controller_redirected"] is True
-    actual = [line for line in invocations.read_text().splitlines() if line.startswith("exec")]
-    assert actual == ["exec", "exec", "exec resume " + journal["threads"]["worker"],
-                      "exec resume " + journal["threads"]["controller"]]
-    assert "sandbox" not in invocations.read_text().splitlines()
+    roles_seen = [step["role"] for step in journal["steps"]]
+    assert roles_seen[:3] == ["worker", "controller", "worker"] and roles_seen[-1] == "controller"
+    decisions = journal["gate_decisions"]
+    assert (decisions[0]["action"], decisions[0]["reason"]) == ("consult", "authoritative_plateau")
+    assert decisions[0]["controller_outcome"] == "redirected"
+    assert (decisions[-1]["action"], decisions[-1]["reason"]) == ("finalize", "deadline_reserve")
+    assert all(d["action"] != "finalize" for d in decisions[:-1])
+    assert len(set(journal["threads"].values())) == 2
+    lines = invocations.read_text().splitlines()
+    execs = [line for line in lines if line.startswith("exec")]
+    # Two fresh native sessions, then only resumes of those two exact sessions.
+    assert execs[:2] == ["exec", "exec"]
+    assert set(execs[2:]) == {"exec resume " + journal["threads"][role] for role in ("worker", "controller")}
+    assert "sandbox" not in lines
     assert fixture["_quota_spend_count"](runtime) == 1

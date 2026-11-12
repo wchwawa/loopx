@@ -165,10 +165,13 @@ without a model call. It consults the Controller when:
 Each trigger fires once per piece of new evidence, so a standing plateau does
 not interrupt the Worker again until more results arrive. A consult gives the
 Controller the original contract, the measured facts and the latest Worker
-report. It answers with a redirection for the Worker, `continue`, or the typed
-result. Near the deadline the Host reserves time and asks the Controller for
-the typed result (`deadline_reserve`). A failed native Worker turn resumes the
-same thread with bounded backoff while budget remains.
+report. It answers with a redirection for the Worker or `continue`. A consult
+cannot end the Turn early, and a failed or empty consult leaves the Worker on
+its own direction and session. Near the deadline the Host reserves time and
+asks the Controller for the typed result (`deadline_reserve`). A failed native
+Worker turn resumes the same thread with bounded backoff while budget remains.
+Use the default `every-return` gate for bounded work that should settle as soon
+as the Worker finishes.
 
 `--evidence-command-json` names a trusted argv that the Host runs after each
 Worker return. It prints one `turn_worker_evidence_v0` object:

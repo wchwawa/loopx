@@ -1183,10 +1183,11 @@ measured outside the conversation:
   shared scoped-fidelity operator), or an idle Worker, once per piece of new
   evidence.
 - **Controller.** On a consult it receives the contract, the measured facts and
-  the latest report, and answers with a redirection, `continue` or the typed
-  result. It always authors the Core receipt at the deadline reserve. `never`
-  keeps only that last turn, which separates the effect of a continuous Worker
-  from the effect of Controller judgment.
+  the latest report, and answers with a redirection or `continue`. A consult
+  cannot end the Turn early, and its failure leaves the Worker on its own
+  direction and session. The Controller authors the Core receipt at the
+  deadline reserve. `never` keeps only that last turn, which separates the
+  effect of a continuous Worker from the effect of Controller judgment.
 
 Every decision is recorded with its reason and facts beside per-role usage.
 The default `every-return` behaviour, the admitted configuration identity and
