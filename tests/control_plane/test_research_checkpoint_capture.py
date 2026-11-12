@@ -32,17 +32,20 @@ def test_feature_off_and_failed_wakes_do_not_read_request_or_settlement(monkeypa
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native benchmark uses the POSIX source launcher")
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
 @pytest.mark.parametrize(("changed_reference", "replan"), [(False, False), (True, False), (False, True)])
-def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, changed_reference, replan):
+def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, provider, changed_reference, replan):
     import shlex
     import subprocess
     import sys
+
+    from loopx.control_plane.turn_driver.codex_context import codex_context_hook
 
     isolate_sqlite_runtime(tmp_path, monkeypatch)
     project, runtime, registry = cli._write_fixture(tmp_path)
     if replan:
         cli._configure_autonomous_replan_fixture(project, runtime, registry)
-    cli._initialize_fixture_authority(project, runtime, provider="sqlite")
+    cli._initialize_fixture_authority(project, runtime, provider=provider)
     cli_path = Path(__file__).resolve().parents[2] / "scripts/loopx"
     turn = "wake-prepared-native-context"
     logs = tmp_path / "logs"
@@ -51,6 +54,9 @@ def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, chan
     wake.mkdir(parents=True)
     context = tmp_path / "context"
     context.mkdir(mode=0o700)
+    session = "benchmark-prepared-native-context"
+    codex_context_hook(str(context), {"hook_event_name": "SessionStart", "source": "startup",
+        "session_id": session, "cwd": str(project)})
     request = tmp_path / "request.json"
     request.write_text(json.dumps({"trigger": "fresh_replan", "destination": str(logs / "checkpoints"),
         "components": [{"id": "fixture", "source_path": str(project)}], "point_metadata": {}}))
@@ -58,7 +64,8 @@ def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, chan
         "LOOPX_PYTHON": sys.executable, "LOOPX_REGISTRY": str(registry), "LOOPX_RUNTIME_ROOT": str(runtime),
         "LOOPX_GOAL_ID": cli.GOAL_ID, "LOOPX_AGENT_ID": cli.AGENT_ID, "LOOPX_WAKE_LOG_DIR": str(wakes),
         "LOOPX_CHECKPOINT_REQUEST": str(request), "LOOPX_CONTEXT_DELIVERY": "on",
-        "LOOPX_CODEX_CONTEXT_DIR": str(context), "LOOPX_EXECUTION_MODE": "heartbeat"}
+        "LOOPX_CODEX_CONTEXT_DIR": str(context), "LOOPX_EXECUTION_MODE": "heartbeat",
+        "CODEX_THREAD_ID": session}
     observed = []
     actual_run = subprocess.run
 
@@ -84,18 +91,12 @@ def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, chan
         command = shlex.split(next(line for line in body.splitlines() if " quota context-project " in line))
         source = Path(command[command.index("--capture-file") + 1])
         digest = command[command.index("--capture-sha256") + 1]
-        assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
-        assert json.loads(source.read_bytes())["heartbeat_receipt"]["turn_instance_id"] == turn
-        assert source.name == "decision.json"
-        assert digest == observed[0]["capture_sha256"]
-        assert not list(wake.glob("checkpoint-start-*/checkpoint-start-view.json"))
+        [original] = wake.glob("checkpoint-start-*/decision-original/decision.json")
+        original_bytes = original.read_bytes()
+        assert (wake / "checkpoint-start-guard.json").read_bytes() == original_bytes
+        original_packet = json.loads(original_bytes)
+        assert original_packet["heartbeat_receipt"]["turn_instance_id"] == turn
         if replan:
-            from loopx.control_plane.turn_driver.codex_context import codex_context_hook
-
-            session = "checkpoint-native-session"
-            codex_context_hook(str(context), dict(session_id=session, cwd=str(project),
-                hook_event_name="SessionStart", source="startup"))
-            env["CODEX_THREAD_ID"] = session
             selected = actual_run(command, cwd=project, env=env, capture_output=True, text=True, check=True)
             page = json.loads(selected.stdout)
             assert page["ok"] and page["eof"], page
@@ -103,12 +104,88 @@ def test_native_preflight_uses_the_committed_capture(tmp_path, monkeypatch, chan
             review = actual_run(shlex.split(actions["/replan_action_packet/review"]),
                                 cwd=project, env=env, capture_output=True, text=True, check=True)
             review_packet = json.loads(review.stdout)
-            original_packet = json.loads(source.read_bytes())
             assert review_packet["obligation_id"] == original_packet["replan_action_packet"]["obligation_id"]
-            assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+            assert review_packet["planning_guidance"] == original_packet["replan_action_packet"]["planning_guidance"]
+            assert actions["/heartbeat_receipt"] == original_packet["heartbeat_receipt"]
+            native = json.loads((context / "session.json").read_bytes())
+            assert native["recovery"]["target"]["surface"] == "complete_turn"
+            assert native["recovery"]["target"]["capture_id"] == digest
+        assert source == original
+        assert digest == observed[0]["capture_sha256"] == hashlib.sha256(original_bytes).hexdigest()
+        assert original.read_bytes() == original_bytes
+        assert not list(wake.glob("checkpoint-start-*/checkpoint-start-view.json"))
         assert body.endswith("original work instructions")
     assert len(observed) == 1 and "interaction_contract" not in observed[0]
     assert cli._heartbeat_receipt_count(runtime, turn) == 1
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_checkpoint_handoff_checks_the_original_contract_before_capture(tmp_path, monkeypatch, provider):
+    import socket
+
+    from benchmark.runtime.checkpoint import held_quota_decision
+    from loopx.control_plane.effect_runtime import EffectRuntimeRemoteError
+    from loopx.control_plane.quota.turn_envelope import compose_turn_decision
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = cli._write_fixture(tmp_path)
+    cli._configure_autonomous_replan_fixture(project, runtime, registry)
+    cli._initialize_fixture_authority(project, runtime, provider=provider)
+    root = tmp_path / "captures"
+    original_dir = root / "original"
+    root.mkdir(mode=0o700)
+    code, source = cli._run_cli(registry, runtime, "quota", "should-run",
+        "--goal-id", cli.GOAL_ID, "--agent-id", cli.AGENT_ID, "--turn-instance-id", cli.TURN_ID,
+        "--context-delivery", "off", "--decision-output-dir", str(original_dir), cwd=project)
+    assert code == 0 and source["schema_version"] == "loopx_turn_envelope_v1"
+    original = original_dir / "decision.json"
+    original_bytes = original.read_bytes()
+    assert json.loads(original_bytes) == source
+    obligation = source["replan_action_packet"]["obligation_id"]
+
+    def transfer(path, error=None):
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        client, channel = socket.socketpair()
+        with client, channel:
+            client.settimeout(5)
+            client.sendall(json.dumps({"path": str(path), "sha256": digest}).encode() + b"\n")
+            handoff = held_quota_decision(None, root, goal_id=cli.GOAL_ID, agent_id=cli.AGENT_ID,
+                turn_instance_id=cli.TURN_ID, accepted_channel=channel)
+            if error:
+                with pytest.raises(EffectRuntimeRemoteError, match=error), handoff:
+                    pytest.fail("An invalid original contract reached checkpoint capture")
+                assert client.recv(4096) == b""
+            else:
+                with handoff as held:
+                    assert held["intent"]["capture"] and held["intent"]["obligation_id"] == obligation
+                    assert held["intent"]["execution_authority_granted"] is False
+                assert json.loads(client.recv(4096)) == {"released": True, "sha256": digest}
+        assert path.read_bytes() == raw
+
+    def materialize(name, packet):
+        directory = root / name
+        directory.mkdir(mode=0o700)
+        path = directory / "decision.json"
+        path.write_text(json.dumps(packet))
+        return path
+
+    transfer(original)
+    changed = {**source, "replan_action_packet": {**source["replan_action_packet"],
+        "planning_guidance": "Changed after the source was sealed."}}
+    transfer(materialize("changed", changed), "content integrity mismatch")
+    transfer(materialize("future", {**source, "schema_version": "loopx_turn_envelope_future"}),
+             "unsupported complete Turn decision version")
+    transfer(materialize("unbound", {key: value for key, value in source.items() if key != "contract_binding"}),
+             "Turn contract binding")
+    legacy = {key: value for key, value in source.items() if key not in {"schema_version", "contract_binding"}}
+    transfer(materialize("legacy", legacy))
+    precision = compose_turn_decision({**legacy, "precision_fixture": [2**53 + 1, -0.0, 1.0]})
+    transfer(materialize("precision", precision))
+    transfer(materialize("rounded", {**precision, "precision_fixture": [2**53, -0.0, 1.0]}),
+             "content integrity mismatch")
+    assert original.read_bytes() == original_bytes
+    assert cli._heartbeat_receipt_count(runtime, cli.TURN_ID) == 1 and cli._spend_run_count(runtime) == 0
 
 
 def test_closed_budget_never_reads_the_request_or_replays_work(monkeypatch):

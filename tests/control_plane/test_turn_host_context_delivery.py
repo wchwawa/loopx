@@ -14,7 +14,7 @@ import pytest
 import loopx
 
 from loopx.control_plane.quota.turn_envelope import (
-    build_turn_envelope, compose_turn_decision, turn_envelope_action_signature_document,
+    build_turn_envelope, turn_envelope_action_signature_document,
 )
 from loopx.control_plane.turn_driver.decision_capture import prepare_turn_decision_capture
 from loopx.control_plane.turn_driver.driver import build_loopx_turn_plan
@@ -76,9 +76,19 @@ def test_captured_context_reaches_actual_host_without_readmission(tmp_path, monk
     assert produced.returncode == 0, produced.stdout + produced.stderr
     original = (capture / "decision.json").read_bytes()
     source = json.loads(original)
+    assert source["schema_version"] == "loopx_turn_envelope_v1"
     if mode == "legacy_reference":
-        assert json.loads(produced.stdout)["schema_version"] == "loopx_turn_envelope_v0"
-    envelope = build_turn_envelope(source, captured_decision_path=str(capture / "decision.json"))
+        envelope = json.loads(produced.stdout)
+        assert envelope["schema_version"] == "loopx_turn_envelope_v0"
+        signature = envelope["action_signature"]
+        assert signature["matches"] is True
+        assert signature["source_hash"] == signature["envelope_hash"] == _canonical_hash(
+            turn_envelope_action_signature_document(envelope),
+        )
+        assert signature["source_decision_hash"] == source["contract_binding"]["content_hash"]
+        assert Path(envelope["detail_ref"]["captured_decision"]["path"]).resolve() == (capture / "decision.json").resolve()
+    else:
+        envelope = build_turn_envelope(source, captured_decision_path=str(capture / "decision.json"))
     context = source["interaction_contract"].get("agent_context")
     assert bool(context) is (mode != "off")
     if not context:
@@ -102,14 +112,11 @@ def test_captured_context_reaches_actual_host_without_readmission(tmp_path, monk
     )
     command = [sys.executable, "-m", "loopx.dsh_goal_mode", "--workspace", str(project),
                "--dsh-home", str(tmp_path / "host-home"), "--dsh-runner", str(runner)]
-    # Ordinary quota still emits v0 in this extraction. Its recorded envelope
-    # must not be paired with a newly normalized source. Current Turn planning
-    # accepts that complete source directly and publishes its own capture.
-    plan = build_loopx_turn_plan(envelope if mode == "legacy_reference" else compose_turn_decision(source),
+    plan = build_loopx_turn_plan(envelope if mode == "legacy_reference" else source,
         host="dsh", execution_mode="isolated-headless", turn_instance_id="host-context-turn")
     if mode != "legacy_reference":
         plan = prepare_turn_decision_capture(plan, journal_path=tmp_path / "current-turn" / "journal.json",
-            decision=plan["work_contract"], existing_journal=False)
+            decision=source, existing_journal=False)
     request = build_loopx_turn_host_request(plan)
     before = {p: p.read_bytes() for p in runtime.rglob("*") if p.is_file()}
     result = subprocess.run(command, input=json.dumps(request), text=True, capture_output=True, timeout=30)
@@ -148,6 +155,7 @@ def test_captured_context_reaches_actual_host_without_readmission(tmp_path, monk
         assert json.loads(Path(detail["path"]).read_text()) == actual["work_contract"]
         assert actual["work_contract"] == plan["work_contract"]
         assert "Validate the complete acceptance: " + "preserve original evidence; " * 180 in json.dumps(actual["work_contract"])
+        assert actual["work_contract"] == source
         assert "turn_envelope" not in actual and "turn_authority" not in actual
         delivered_context = actual["work_contract"]["interaction_contract"].get("agent_context")
         assert delivered_context == context
@@ -198,18 +206,18 @@ def test_bound_replan_reaches_actual_host_with_original_evidence(tmp_path, monke
     code, envelope = _run_cli(registry, runtime, "quota", "should-run",
         "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
         "--todo-id", SELECTED_REPLAN_TODO_ID, "--turn-instance-id", turn,
-        "--codex-app", "--turn-envelope", "--decision-output-dir", str(capture), cwd=project)
+        "--codex-app", "--complete-turn", "--decision-output-dir", str(capture), cwd=project)
     assert code == 0, envelope
     original = (capture / "decision.json").read_bytes()
     source = json.loads(original)
-    assert envelope["schema_version"] == "loopx_turn_envelope_v0"
+    assert envelope == source and source["schema_version"] == "loopx_turn_envelope_v1"
     agent_channel = source["interaction_contract"]["agent_channel"]
     assert agent_channel["delivery_allowed"] is False
     assert agent_channel["must_attempt"] is True
-    plan = build_loopx_turn_plan(compose_turn_decision(source), host="dsh", execution_mode="isolated-headless",
+    plan = build_loopx_turn_plan(source, host="dsh", execution_mode="isolated-headless",
                                  turn_instance_id=turn)
     plan = prepare_turn_decision_capture(plan, journal_path=tmp_path / "turn" / "journal.json",
-        decision=plan["work_contract"], existing_journal=False)
+        decision=source, existing_journal=False)
     assert plan["route"]["kind"] == "replan_required"
     assert plan["route"]["would_invoke_host"] is True
     assert source["heartbeat_receipt"]["settlement_identity"]["todo_id"] == SELECTED_REPLAN_TODO_ID
@@ -234,7 +242,7 @@ def test_bound_replan_reaches_actual_host_with_original_evidence(tmp_path, monke
     prompt_path = project / "received.txt"
     prompt = prompt_path.read_text()
     actual, _ = json.JSONDecoder().raw_decode(prompt.split("Turn request:\n", 1)[1])
-    assert actual["work_contract"] == plan["work_contract"]
+    assert actual["work_contract"] == source == plan["work_contract"]
     # This Goal body is a pending original read, exercised below; a complete
     # contract does not require every retained source to be inline.
     assert "turn_envelope" not in actual and "turn_authority" not in actual
@@ -248,6 +256,7 @@ def test_bound_replan_reaches_actual_host_with_original_evidence(tmp_path, monke
     assert (captured["goal_id"], captured["agent_id"], captured["turn_instance_id"]) == (GOAL_ID, AGENT_ID, turn)
     read = subprocess.run(shlex.split(detail["full_decision"]), capture_output=True, check=True).stdout
     assert json.loads(read) == plan["work_contract"]
+    assert read == original
     assert build_turn_envelope(json.loads(read))["action_signature"]["source_decision_hash"] == actual["source_decision_hash"]
     assert context["obligation_id"] == source["replan_action_packet"]["obligation_id"]
     goal_read = next(r for r in agent_channel["required_reads"] if r["source"] == "goal_state")

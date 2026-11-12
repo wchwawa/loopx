@@ -1,5 +1,6 @@
 """A deferred selection must expose a runnable recovery before settlement."""
 import json
+from pathlib import Path
 import shlex
 import subprocess
 
@@ -428,20 +429,36 @@ def test_inline_reentry_reads_gates_changed_after_choice_receipt(
 
 
 @pytest.mark.parametrize("discovery", [False, True])
-def test_first_inline_result_has_matching_turn_envelope(tmp_path, discovery):
+@pytest.mark.parametrize("context_delivery", ["off", "on"])
+def test_first_inline_result_has_matching_turn_envelope(tmp_path, discovery, context_delivery):
+    from tests.control_plane.codex_checkpoint_fixture import read_cli_policy_payload
+
     project, runtime, registry = _write_fixture(tmp_path)
     _configure_selected_todo_replan_fixture(project, registry)
     _initialize_fixture_authority(project, runtime, provider="sqlite")
     turn = "turn-inline-envelope"
     guard = ("quota", "should-run", "--codex-app", "--goal-id", GOAL_ID,
-             "--agent-id", AGENT_ID, "--turn-instance-id", turn,
+             "--agent-id", AGENT_ID, "--turn-instance-id", turn, "--context-delivery", context_delivery,
              )
     if discovery:
         rc, first = _run_cli(registry, runtime, *guard)
+        first = read_cli_policy_payload(json.dumps(first), returncode=rc)
         assert rc == 0 and first["interaction_contract"]["cli_channel"]["selection_required"]
+    compatibility_view = ("--turn-envelope",) if context_delivery == "off" else ()
     rc, envelope = _run_cli(registry, runtime, *guard,
-                            "--todo-id", SELECTED_REPLAN_TODO_ID, "--turn-envelope")
+                            "--todo-id", SELECTED_REPLAN_TODO_ID, *compatibility_view)
     assert rc == 0, envelope
+    from loopx.control_plane.quota.turn_envelope import _turn_envelope_result, build_turn_envelope
+    if context_delivery == "on":
+        envelope = read_cli_policy_payload(json.dumps(envelope), returncode=rc)
+        assert envelope["schema_version"] == "loopx_turn_envelope_v1"
+        assert _turn_envelope_result("complete_consumer", payload=envelope)["ok"]
+        # Progressive delivery keeps the complete source. Its historical
+        # executor adapter still derives the same original first-call action.
+        envelope = build_turn_envelope(envelope)
+    else:
+        # Explicit off retains the requested bounded compatibility view.
+        assert envelope["schema_version"] == "loopx_turn_envelope_v0"
     assert envelope["action_signature"]["matches"] is True
     contract = envelope["contract_capsule"]["interaction_contract"]
     assert contract["mode"] == "autonomous_replan"
@@ -531,10 +548,23 @@ def test_native_first_selection_publishes_only_final_bound_capture(tmp_path, mon
     )
     read = json.loads(result.stdout)
     assert read["ok"] and read["eof"]
-    _, source_reference = read_context_read_reference(presented["recovery"]["reference_file"])
+    # Native model output uses opaque reader references. Compare their complete
+    # machine-owned source identity, not a digest omitted from the model view.
+    _, original_reference = read_context_read_reference(presented["recovery"]["reference_file"])
     _, selected_reference = read_context_read_reference(read["reference_file"])
-    assert selected_reference["path"] == source_reference["path"]
-    assert selected_reference["sha256"] == source_reference["sha256"]
+    assert selected_reference["path"] == original_reference["path"]
+    assert selected_reference["sha256"] == original_reference["sha256"]
+    saved_capture = Path(selected_reference["path"])
+    assert json.loads(saved_capture.read_bytes()) == original
     assert json.loads(read["content"])["selections"][0]["value"] == original["heartbeat_receipt"]
+    # Identical JSON semantics with different original bytes still fail closed;
+    # a reader failure cannot allocate another admission or spend.
+    saved_capture.write_bytes(saved_capture.read_bytes() + b" ")
+    refusal = subprocess.run(
+        [*reader, "--select", "/heartbeat_receipt"],
+        cwd=project, capture_output=True, text=True, check=False, timeout=60,
+    )
+    rejected = json.loads(refusal.stdout)
+    assert refusal.returncode != 0 and rejected["ok"] is False and "content" not in rejected
     assert _heartbeat_receipt_count(runtime, turn) == 1
     assert _spend_run_count(runtime) == 0

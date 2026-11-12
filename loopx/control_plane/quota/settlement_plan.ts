@@ -72,7 +72,18 @@ function receiptBoundCliSettlement(params: JsonObject, requirePreparation: boole
 }
 
 export function nativeCliSettlementProjection(params: JsonObject): JsonObject {
-  const cli = jsonObject(params.cli), composed = receiptBoundCliSettlement(params, true);
+  const cli = jsonObject(params.cli);
+  let composed: JsonObject | null;
+  if (Object.hasOwn(params, "complete_scope")) {
+    const scope = jsonObject(params.complete_scope);
+    if (!scope || !cli) return {};
+    composed = completeCliSettlementChannel({...scope,
+      agent_identity: {agent_id: scope.agent_id}, selected_todo: {todo_id: params.todo_id},
+      heartbeat_receipt: params.receipt, interaction_contract: {
+        cli_channel: cli, agent_channel: {delivery_allowed: scope.delivery_allowed}}});
+  } else {
+    composed = receiptBoundCliSettlement(params, true);
+  }
   return !cli || !composed || composed === cli ? {} : contextProjectionChanges(cli, composed);
 }
 

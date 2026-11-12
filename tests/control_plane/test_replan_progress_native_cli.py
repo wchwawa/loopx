@@ -140,12 +140,17 @@ def test_progress_cli_reads_policy_with_context_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
     context_delivery: str,
 ) -> None:
+    from loopx.control_plane.turn_driver.codex_context import codex_context_hook
+
     tmp_path = tmp_path.resolve()
     isolate_sqlite_runtime(tmp_path, monkeypatch)
     fixture = make_progress_cli_fixture(tmp_path, provider, "advanced")
     native, captures = tmp_path / "native", tmp_path / "captures"
     native.mkdir(mode=0o700)
     captures.mkdir(mode=0o700)
+    monkeypatch.setenv("CODEX_THREAD_ID", "replan-progress-session")
+    codex_context_hook(str(native), {"session_id": "replan-progress-session",
+        "cwd": str(fixture["project"]), "hook_event_name": "SessionStart", "source": "startup"})
     try:
         presented = call_progress_cli(
             fixture, "quota", "should-run", "--codex-app", "--goal-id", GOAL,
@@ -164,6 +169,17 @@ def test_progress_cli_reads_policy_with_context_delivery(
         assert (identity["goal_id"], identity["agent_id"]) == (GOAL, AGENT)
         assert identity["todo_id"] == TODO
         assert policy["execution_obligation"]["must_attempt_work"] is True
+        [original] = captures.glob("decision-*/decision.json")
+        source = json.loads(original.read_bytes())
+        assert source["heartbeat_receipt"] == policy["heartbeat_receipt"]
+        if context_delivery == "on":
+            packet = policy["replan_action_packet"]
+            reader = shlex.split(packet["review"])
+            assert reader[reader.index("--decision-file") + 1] == str(original)
+            assert "replan_context" not in policy["autonomous_replan_obligation"]
+            assert "settlement_plan" not in policy["interaction_contract"]["cli_channel"]
+        else:
+            assert policy["replan_action_packet"] == source["replan_action_packet"]
     finally:
         restart_effect_runtime(wait_for_exit=True)
 
@@ -202,16 +218,43 @@ def test_captured_replan_preserves_scoped_memory_without_trusting_reader_locatio
             "--prepared-capture-reference", "--defer-context-presentation"])
         output = capsys.readouterr().out
         assert code == 0, output
-        captured = (capture / "decision.json").read_bytes()
-        assert json.loads(output)["capture_sha256"] == hashlib.sha256(captured).hexdigest()
+        original = capture / "decision.json"
+        captured = original.read_bytes()
+        digest = hashlib.sha256(captured).hexdigest()
+        assert json.loads(output)["capture_sha256"] == digest
         source = json.loads(captured)
         assert source["replan_action_packet"]["decision"] == "replan_required"
         assert source["reward_memory_recall"]["status"] == "applied" and memory.calls == 1
         projected = project_turn_context(source)
         assert projected["reward_memory_recall"]["context"]["guidance"]
-        relocated = {**source, "replan_read_path": str(tmp_path / "other-location.json")}
-        assert project_turn_context(relocated) == projected
-        changed = deepcopy(relocated)
+        authority = _authority(fixture)
+        moved = original.rename(tmp_path / "other-location.json")
+        response = call_progress_cli(fixture, "quota", "context-project", "--codex-app",
+            "--goal-id", GOAL, "--agent-id", AGENT, "--turn-instance-id", TURN,
+            "--capture-file", str(moved), "--capture-sha256", digest, "--initial-read",
+            "--context-delivery", "on", "--delta-delivery", "auto", "--codex-context-dir", str(journal))
+        assert response["navigation"]["mode"] == "full"
+        assert "baseline_reference" not in response["navigation"]
+        view = read_cli_policy_payload(json.dumps(response), returncode=0)
+        assert view["reward_memory_recall"] == source["reward_memory_recall"]
+        assert view["heartbeat_receipt"] == source["heartbeat_receipt"]
+        reader = shlex.split(view["replan_action_packet"]["review"])
+        assert reader[reader.index("--decision-file") + 1] == str(moved)
+        review = call_progress_cli(fixture, *reader[reader.index("quota"):])
+        assert review["source_hash"] == source["contract_binding"]["content_hash"]
+        writer = shlex.split(review["next"]["writeback"])
+        writeback = call_progress_cli(fixture, *writer[writer.index("quota"):])
+        assert writeback["writeback"]["settlement_plan"]["identity"] == (
+            source["heartbeat_receipt"]["settlement_identity"])
+        assert moved.read_bytes() == captured and not original.exists()
+        assert project_turn_context(json.loads(moved.read_bytes())) == projected
+        assert _authority(fixture) == authority and memory.calls == 1
+        assert not (journal / "session.json").exists()
+
+        # Relocating the file does not edit the signed source. Changing either
+        # its recorded path or executable settlement must reject scoped recall.
+        assert project_turn_context({**source, "replan_read_path": str(moved)}) == {}
+        changed = deepcopy(source)
         plan = changed["interaction_contract"]["cli_channel"]["settlement_plan"]
         plan["ordered_steps"][1]["command_template"] += " --evidence substituted"
         assert project_turn_context(changed) == {}
@@ -437,10 +480,11 @@ def test_stalled_stride_review_drives_an_executed_mechanism_comparison(
     def call(*args: str, expected_code: int = 0) -> dict:
         return call_progress_cli(fixture, *args, expected_code=expected_code)
 
-    def guard(turn: str, *, todo: str | None = TODO) -> dict:
+    def guard(turn: str, *, todo: str | None = TODO, capture: Path | None = None) -> dict:
         return call("quota", "should-run", "--codex-app", "--goal-id", GOAL,
             "--agent-id", AGENT, "--turn-instance-id", turn,
-            *(["--todo-id", todo] if todo else []), )
+            *(["--todo-id", todo] if todo else []),
+            *(["--decision-output-dir", str(capture)] if capture is not None else []))
 
     def spend(turn: str, *, todo: str | None = TODO, obligation: str | None = None) -> dict:
         return call("quota", "spend-slot", "--goal-id", GOAL, "--agent-id", AGENT,
@@ -469,7 +513,8 @@ def test_stalled_stride_review_drives_an_executed_mechanism_comparison(
         call("todo", "update", "--goal-id", GOAL, "--agent-id", AGENT, "--todo-id", TODO,
             "--text", complete_scope)
         guard(TURN, todo=None)
-        admitted = guard(TURN)
+        capture = tmp_path / "original-decision"
+        admitted = guard(TURN, capture=capture)
         obligation = admitted["autonomous_replan_obligation"]
         assert [item["kind"] for item in obligation["triggers"]] == ["typed_progress_repeat"]
         assert "fresh_vision_path_outcome" in obligation["replan_context"]["uncovered_frontier"]["required_any_of"]
@@ -481,7 +526,46 @@ def test_stalled_stride_review_drives_an_executed_mechanism_comparison(
 
         control = admitted["replan_action_packet"]["stride_control"]
         assert control["review_reference_limit"] == 3
-        decision = {**control["minimal_example"], "basis": "unexplained_gap", "action": "verify",
+        captured = capture / "decision.json"
+        source = json.loads(captured.read_bytes())
+        original_bytes = captured.read_bytes()
+        def read_generated(command):
+            words = shlex.split(command)
+            return call(*words[words.index("quota"):])
+
+        projected = call("quota", "context-project", "--codex-app", "--goal-id", GOAL, "--agent-id", AGENT,
+            "--turn-instance-id", TURN, "--capture-file", str(captured),
+            "--capture-sha256", hashlib.sha256(original_bytes).hexdigest(), "--initial-read",
+            "--context-delivery", "on", "--delta-delivery", "off", "--max-page-output-bytes", "64000")
+        content = []
+        while True:
+            content.append(projected["content"])
+            if projected["eof"]:
+                break
+            projected = read_generated(projected["next_command"])
+        review_path = "/replan_action_packet/review"
+        review_command = next(row["value"] for row in json.loads("".join(content))["selections"]
+                              if row["pointer"] == review_path)
+        review = read_generated(review_command)
+        writer = read_generated(review["next"]["writeback"])
+        plan = writer["writeback"]["settlement_plan"]
+        index, step = next((i, step) for i, step in enumerate(plan["ordered_steps"])
+                           if step["kind"] == "durable_writeback")
+        authoring = step["vision_authoring"]
+        assert writer["writeback_contract"]["vision_authoring_ref"] == (
+            f"$.writeback.settlement_plan.ordered_steps[{index}].vision_authoring")
+        assert "vision_authoring" not in writer["writeback_contract"]
+        assert "minimal_example" not in writer["stride_control"]
+        assert authoring["total_text_limit"] == 1800
+        assert "shared" in authoring["authoring_hint"] and "stride_decision" in authoring["authoring_hint"]
+        example = authoring["minimal_example"]
+        assert example["stride_decision"] == control["minimal_example"]
+        assert plan["identity"] == source["heartbeat_receipt"]["settlement_identity"]
+        assert captured.read_bytes() == original_bytes and fixture["index"].read_bytes() == original_index
+        historical = read_generated(review["next"]["writeback"].replace("--context-delivery on", "--context-delivery off"))
+        assert historical["stride_control"]["minimal_example"] == control["minimal_example"]
+        assert "vision_authoring" in historical["writeback_contract"]
+        decision = {**example["stride_decision"], "basis": "unexplained_gap", "action": "verify",
             "axes": {
                 "work_slice": {"plan": "Run and compare three complete assignment methods.",
                                "reason": "Repeated local changes have not resolved the cost gap."},
@@ -503,7 +587,7 @@ def test_stalled_stride_review_drives_an_executed_mechanism_comparison(
             decision["explore_review"] = {"revision": basis["revision"], "disposition": "used",
                 "considered_refs": [choice["finding_id"]], "selected_candidate": choice,
                 "reason": "Use the recorded outcome to compare mechanisms within the original unfinished task."}
-        packet = {"schema_version": "goal_vision_replan_contract_v0", "state": "vision_patch_proposed",
+        packet = {**example,
             "vision_patch": {"acceptance_summary": "The original minimum-cost validation remains open."},
             "path_delta": {"outcome": "continue", "prior_assumption": "Local changes can resolve the gap.",
                 "observed_reality": "Repeated observations do not establish that explanation.",
@@ -516,6 +600,18 @@ def test_stalled_stride_review_drives_an_executed_mechanism_comparison(
             "--todo-id", TODO, "--turn-instance-id", TURN, "--agent-vision-json", str(vision),
             "--classification", "bounded_replan_progress", "--delivery-batch-scale", "single_surface",
             "--delivery-outcome", "outcome_progress", "--no-global-sync", "--suppress-external-sinks")
+        oversized = {**packet,
+            "vision_patch": {**packet["vision_patch"], "vision_summary": "Verified outcome. " * 22,
+                             "role_scope": "Keep the original scope. " * 10},
+            "path_delta": {**packet["path_delta"], "prior_assumption": "A gap remains. " * 20,
+                           "observed_reality": "The check was inconclusive. " * 11}}
+        current_state = fixture["state"].read_bytes()
+        vision.write_text(json.dumps(oversized))
+        over_limit = call(*refresh_args, expected_code=1)
+        assert "total_agent_vision" in over_limit["error"] and "limit is 1800" in over_limit["error"]
+        assert all(f"{field}=" in over_limit["error"] for field in ("vision_patch", "path_delta", "stride_decision"))
+        assert fixture["state"].read_bytes() == current_state and fixture["index"].read_bytes() == original_index
+        vision.write_text(json.dumps(packet))
         if comparison_binding:
             # Reuse the admitted current context, but falsify only the source
             # digest. The typed progress exit must not hide this mismatch.

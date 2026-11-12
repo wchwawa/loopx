@@ -58,6 +58,16 @@ test("complete consumers compose the original admitted CLI plan without inventin
     heartbeat_receipt: {status: "committed", closeout_required: true, turn_instance_id: "turn",
       settlement_identity: plan.identity}};
   const before = structuredClone(source);
+  const scope = {goal_id: "goal", agent_id: "agent", should_run: true,
+    effective_action: "normal_run", normal_delivery_allowed: true, delivery_allowed: true};
+  const request = {cli, receipt: source.heartbeat_receipt, todo_id: "todo", complete_scope: scope};
+  assert.ok(Array.isArray(nativeCliSettlementProjection(request).changes));
+  assert.deepEqual(nativeCliSettlementProjection({cli, receipt: source.heartbeat_receipt, todo_id: "todo"}), {});
+  for (const changed of [{complete_scope: null}, {cli: {...cli, spend_after_validation: false}},
+    {receipt: {...source.heartbeat_receipt, status: "pending"}}, {todo_id: "other"}])
+    assert.deepEqual(nativeCliSettlementProjection({...request, ...changed}), {});
+  for (const changed of [{goal_id: "other"}, {agent_id: "other"}, {delivery_allowed: false}])
+    assert.deepEqual(nativeCliSettlementProjection({...request, complete_scope: {...scope, ...changed}}), {});
   assert.deepEqual(completeCliSettlementChannel(source).next_cli_actions,
     ["writeback --settle-turn --settlement-receipt"]);
   const prepared = {schema_version: EXECUTION_PREPARATION_SCHEMA_VERSION, state: "ready",

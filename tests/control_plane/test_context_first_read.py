@@ -290,6 +290,10 @@ def test_initial_read_keeps_supporting_index_obligations_and_recovers_its_full_l
     assert json.loads(raw) == decision
 
 
+
+
+
+
 @pytest.mark.parametrize("damage", [None, "foreign_plan", "changed_file"])
 def test_native_preparation_reuses_only_its_current_digest_bound_navigation(
     tmp_path, monkeypatch, decision, damage,
@@ -381,6 +385,7 @@ def test_prepared_initial_read_keeps_exact_body_without_retransmitting_unused_pr
         assert legacy_page["content"] == original["content"]
         assert len(observed) == 1
         assert b"Historical evidence remains available." not in observed[0]
+        assert b"unread_branch_" not in observed[0], "Explicit replay needs only the selected address structure"
         assert len(observed[0]) < len(raw) // 2
     else:
         assert len(observed) == 1
@@ -690,6 +695,14 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
 
     binding = ("--goal-id", GOAL_ID, "--agent-id", AGENT_ID, "--todo-id", TODO_ID)
     cli("todo", "claim", *binding, "--claimed-by", AGENT_ID)
+    note_prefix = ("Keep the earlier acceptance evidence. 保留原验收。 " * 180).rstrip()
+    note_suffix = " 新的验证已通过 🧪。"
+
+    def update_note(note, operation):
+        lease = cli("task-lease", "inspect", "--goal-id", GOAL_ID, "--todo-id", TODO_ID)["lease"]
+        cli("todo", "update", *binding, "--note", note, "--update-operation-id", operation,
+            "--task-lease-idempotency-key", lease["idempotency_key"],
+            "--task-lease-expected-version", str(lease["version"]))
 
     def capture(turn):
         if checkpoint_count:
@@ -721,7 +734,9 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
         assert pages[-1]["eof"] and len(body) == pages[-1]["total_bytes"]
         return pages, selected_context_values(body.decode())
 
-    body_pointer = None
+    body_pointer = note_pointer = None
+    if warm and checkpoint_count:
+        update_note(note_prefix, "seed-wide-note")
     if warm:
         prior = capture("wide-prior")
         _, prior_ref = read_context_read_reference(prior["recovery"]["reference_file"])
@@ -731,6 +746,12 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
         prior_pages, prior_facts = read(prior["recovery"]["command"] + " --select " + body_pointer)
         assert narrative in prior_facts[body_pointer]
         deliver(journal, event, prior_pages)
+        if checkpoint_count:
+            index = next(i for i, source in enumerate(rows) if source["source"] == "selected_todo")
+            note_pointer = f"/interaction_contract/agent_channel/work_context/sources/{index}/content/todo/note"
+            note_pages, note_facts = read(prior["recovery"]["command"] + " --select " + note_pointer)
+            assert note_facts[note_pointer] == note_prefix
+            deliver(journal, event, note_pages)
         cli("refresh-state", *binding, "--turn-instance-id", "wide-prior", "--classification", "fixture_verified",
             "--delivery-batch-scale", "implementation", "--delivery-outcome", "outcome_progress",
             "--delivery-boundary", "in_flight_continuation", "--no-global-sync", "--suppress-external-sinks")
@@ -739,6 +760,8 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
         scopes = [*scopes[:-1], "docs/areas/current-fixture-scope/**"]
         configuration["goals"][0]["coordination"]["write_scope"] = scopes
         registry.write_text(json.dumps(configuration))
+        if note_pointer:
+            update_note(note_prefix + note_suffix, "append-wide-note")
 
     view = capture("wide-ready")
     _, source_ref = read_context_read_reference(view["recovery"]["reference_file"])
@@ -797,7 +820,16 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
     if warm:
         assert body_pointer in pages[0]["previously_delivered_fields"] and body_pointer not in remaining
         assert "/goal_boundary/write_scope" not in pages[0]["previously_delivered_fields"]
-        assert leaves(opening | remaining) == {key: value for key, value in leaves(ordinary).items() if key != body_pointer}
+        reconstructed = opening | remaining
+        if note_pointer:
+            assert note_pointer not in pages[0]["previously_delivered_fields"]
+            rows = json.loads("".join(page["content"] for page in pages))["selections"]
+            note = next(row for row in rows if row["pointer"] == note_pointer)
+            assert note["presentation"] == "append_to_observed_text"
+            assert note["prefix_bytes"] == len(note_prefix.encode())
+            assert note["value"] == note_suffix
+            reconstructed[note_pointer] = note_prefix + note["value"]
+        assert leaves(reconstructed) == {key: value for key, value in leaves(ordinary).items() if key != body_pointer}
         deliver(journal, event, pages)
         assert "/goal_boundary/write_scope" in codex_context._state(journal)["consumed_pointers"]
         codex_context.codex_context_hook(str(journal), {**event, "hook_event_name": "PostCompact"})
@@ -805,6 +837,8 @@ def test_ready_opening_keeps_controls_readable_with_a_large_write_scope(
         assert "previously_delivered_fields" not in recovery_pages[0]
         assert not opening.keys() & restored.keys()
         assert leaves(opening | restored) == leaves(ordinary)
+        if note_pointer:
+            assert restored[note_pointer] == note_prefix + note_suffix
     else:
         assert leaves(opening | remaining) == leaves(ordinary)
     assert path.read_bytes() == raw and hashlib.sha256(raw).hexdigest() == source_ref["sha256"]
@@ -831,9 +865,12 @@ def test_advertised_native_reader_keeps_the_complete_current_contract_across_pag
     state = project / f".codex/goals/{GOAL_ID}/ACTIVE_GOAL_STATE.md"
     original_state = state.read_bytes()
     turn_id = "native-first-read"
+    capture_root = tmp_path / "captures"
+    capture_root.mkdir(mode=0o700)
     code, view = _run_cli(registry, runtime, "quota", "should-run", "--codex-app",
         "--context-delivery", "on", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
-        "--todo-id", TODO_ID, "--turn-instance-id", turn_id, cwd=project)
+        "--todo-id", TODO_ID, "--turn-instance-id", turn_id,
+        "--decision-output-root", str(capture_root), cwd=project)
     assert code == 0 and view["mode"] == "full", view
     _, reference = read_context_read_reference(view["recovery"]["reference_file"])
     raw = Path(reference["path"]).read_bytes()
@@ -870,12 +907,16 @@ def test_advertised_native_reader_keeps_the_complete_current_contract_across_pag
     vision_path = next(path for path in expected_cli if path.endswith("/vision_authoring"))
     actions_path = cli_path + "/next_cli_actions"
     current_cli = source["interaction_contract"]["cli_channel"]
-    bound_steps = current_cli["settlement_plan"]["ordered_steps"]
-    actual_commands = [step["command_template"] for step in bound_steps
-                       if step["kind"] in ("durable_writeback", "quota_spend")]
-    assert len(actual_commands) == 2 and current_cli["next_cli_actions"] == actual_commands
-    # The ordered plan carries these exact templates and all their conditions.
-    # A ready first read should not present a second apparent route for them.
+    plan = current_cli["settlement_plan"]
+    assert plan["schema_version"] == "quota_settlement_plan_v1"
+    writeback = next(step for step in plan["ordered_steps"] if step["kind"] == "durable_writeback")
+    spend = next(step for step in plan["ordered_steps"] if step["kind"] == "quota_spend")
+    assert writeback["owner"] == "agent" and "--settle-turn" not in writeback["command_template"]
+    assert spend["owner"] == "agent" and "command_template" in spend
+    actual_commands = [writeback["command_template"], spend["command_template"]]
+    assert current_cli["next_cli_actions"] == actual_commands
+    # The ordered plan carries both exact templates and their conditions.
+    # A ready first read should not present a second apparent route for it.
     assert not any(path == actions_path or path.startswith(actions_path + "/") for path in values)
     # Every distinct CLI leaf outside the authoring reference is still delivered.
     for path, item in expected_cli.items():
@@ -900,7 +941,10 @@ def test_advertised_native_reader_keeps_the_complete_current_contract_across_pag
     assert Path(reference["path"]).read_bytes() == raw and state.read_bytes() == original_state
 
 
-@pytest.mark.parametrize("variant", ["different_argument", "different_order", "unready", "other_effect", "future_plan"])
+@pytest.mark.parametrize("variant", [
+    "different_argument", "different_order", "unready", "other_effect", "future_plan",
+    "composed_extra_fallback", "composed_unexpected_runtime_command",
+])
 def test_initial_read_keeps_fallback_actions_when_the_bound_plan_is_not_equivalent(tmp_path, decision, variant):
     interaction = decision["interaction_contract"]
     cli = interaction["cli_channel"]
@@ -924,8 +968,17 @@ def test_initial_read_keeps_fallback_actions_when_the_bound_plan_is_not_equivale
         cli["execution_preparation"]["state"] = "claim_required"
     elif variant == "other_effect":
         decision["heartbeat_receipt"]["settlement_identity"] = {**identity, "effect_id": "another"}
-    else:
+    elif variant == "future_plan":
         cli["settlement_plan"]["schema_version"] = "unknown_settlement_plan"
+    else:
+        plan = cli["settlement_plan"]
+        plan["schema_version"] = "quota_settlement_plan_v2"
+        plan["ordered_steps"][0]["owner"] = "agent"
+        plan["ordered_steps"][1]["owner"] = "runtime"
+        if variant == "composed_extra_fallback":
+            plan["ordered_steps"][1].pop("command_template")
+        else:
+            cli["next_cli_actions"] = [writeback]
 
     view = native_context_capture_view(decision, tmp_path)
     _, values = read_selection(view["first_read_command"])
@@ -1349,6 +1402,16 @@ def test_initial_read_is_rejected_before_quota_or_machine_access(tmp_path):
     code = handle_native_context_command(Namespace(initial_read=True, quota_command="should-run", format="json"),
         print_payload=lambda value, *_args: output.append(value), registry_path=tmp_path / "unopened-registry.json")
     assert code == 1 and not output[0]["ok"] and "only supported by context-read" in output[0]["reason"]
+    assert not (tmp_path / "unopened-registry.json").exists()
+
+
+def test_selection_digest_without_a_selected_view_is_rejected_before_authority_access(tmp_path):
+    output = []
+    code = handle_native_context_command(Namespace(quota_command="context-read", format="json",
+        selection_sha256="0" * 64), print_payload=lambda value, *_args: output.append(value),
+        registry_path=tmp_path / "unopened-registry.json")
+    assert code == 1 and not output[0]["ok"]
+    assert "requires context-read with --select or --initial-read" in output[0]["reason"]
     assert not (tmp_path / "unopened-registry.json").exists()
 
 
@@ -1935,6 +1998,12 @@ def test_native_first_read_reuses_only_observed_writeback_precondition(
     page, facts = read_selection(second["first_read_command"])
     assert "previously_delivered_fields" not in page and facts[precondition] == text
     assert facts[goal_text] == narrative
+
+
+
+
+
+
 
 @pytest.mark.parametrize("provider", ["file", "sqlite"])
 def test_native_first_read_reuses_only_observed_write_scope(tmp_path, monkeypatch, provider):

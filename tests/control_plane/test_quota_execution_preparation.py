@@ -136,7 +136,7 @@ def _run(
     return packet
 
 
-def _present_saved_guard(tmp_path, native, capture, scenario, turn):
+def _present_saved_guard(tmp_path, native, capture, scenario, turn, *, refused_receipt=None):
     source = capture / "decision.json"
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     code, view = run_json_cli_result(
@@ -146,7 +146,14 @@ def _present_saved_guard(tmp_path, native, capture, scenario, turn):
         "--capture-file", str(source), "--capture-sha256", digest,
         registry_path=tmp_path / "registry.json", runtime_root=tmp_path / "runtime",
     )
-    assert code == 0 and view["ok"] is True, view
+    if refused_receipt is not None:
+        assert code == 1 and view["ok"] is False, view
+        assert view["error_code"] == "quota_decision_transport_failed"
+        assert view["reason"] == "complete Turn decision content integrity mismatch"
+        assert view["heartbeat_receipt"] == refused_receipt
+        assert not {"execution_preparation", "interaction_contract", "first_read_command"} & view.keys()
+    else:
+        assert code == 0 and view["ok"] is True, view
     return digest
 
 
@@ -457,8 +464,21 @@ def test_native_hook_returns_readable_ready_source_and_original_claim(
     assert observed.returncode == 0, observed.stderr
     ready_page = json.loads(observed.stdout)
     assert ready_page["ok"] and ready_page["sha256"] == readback["capture_sha256"]
+    observations = []
+    if readback_command[readback_command.index("quota") + 1] == "context-project":
+        # The complete source must pass validation before its first page is
+        # readable. The projection itself does not prove delivery of any bytes.
+        observations.append((ready_page, True))
+        reader = shlex.split(ready_page["recovery"]["command"])
+        assert reader[reader.index("quota") + 1] == "context-read"
+        observed = subprocess.run(reader, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+        assert observed.returncode == 0, observed.stderr
+        ready_page = json.loads(observed.stdout)
+        assert ready_page["ok"] and ready_page["sha256"] == readback["capture_sha256"]
+    assert ready_page["offset"] == 0 and ready_page["content"]
     forged = {**ready_page, "content": "x" + ready_page["content"][1:]}
-    for observation, should_repeat in ((forged, True), (ready_page, False)):
+    observations.extend(((forged, True), (ready_page, False)))
+    for observation, should_repeat in observations:
         shown = subprocess.run(hook, input=json.dumps({**hook_event, "tool_response": observation}),
             env=hook_env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
         assert shown.returncode == 0, shown.stderr
@@ -612,7 +632,7 @@ def test_prepared_hook_refuses_a_replaced_ready_capture_without_reclaim(
     "after-ready-released-execution", "legacy-same-execution", "legacy-released-execution",
     "reencoded-released-execution", "legacy-marked-released-execution",
 ])
-def test_native_hook_replays_the_original_claim_after_guard_timeout(
+def test_native_hook_recovers_the_original_claim_after_guard_timeout(
     tmp_path, monkeypatch, capsys, provider, case,
 ):
     import io
@@ -681,25 +701,36 @@ def test_native_hook_replays_the_original_claim_after_guard_timeout(
         assert code == 0 and payload["ok"], payload
         return payload
 
+    def projected_read(command):
+        result = subprocess.run(shlex.split(command), cwd=tmp_path, capture_output=True,
+                                check=True, text=True)
+        return json.loads(result.stdout)
+
     if legacy:
-        # Before the upgrade the Host issued the ordinary claim without a
-        # persisted operation ID, then could lose the ready result.
+        # Older Hosts may have committed a claim without a captured operation ID.
         legacy_claim = read(*before["execution_preparation"]["claim"]["cli_args"])
         original_id = legacy_claim["claim_operation_id"]
+        original = read("todo", "receipt", "--goal-id", GOAL, "--operation-id", original_id)
     else:
-        first_context = hook()["hookSpecificOutput"]["additionalContext"]
-        first_request = json.loads(first_context.rsplit("Receipt: ", 1)[1])
-        assert first_request["event"] == "host_execution_preparation_readback_required"
+        hint = hook()["hookSpecificOutput"]["additionalContext"]
+        request = json.loads(hint.rsplit("Receipt: ", 1)[1])
+        assert request["event"] == "host_execution_preparation_readback_required"
+        assert (request["goal_id"], request["agent_id"], request["todo_id"], request["turn_instance_id"]) == (
+            GOAL, AGENT, TODO, turn,
+        )
         original_id = claims[0]["claim_operation_id"]
-        assert original_id == f"todo-claim:codex-capture:{digest}"
-        assert first_request["claim_operation_id"] == original_id
-    original = read("todo", "receipt", "--goal-id", GOAL, "--operation-id", original_id)
+        assert request["claim_operation_id"] == original_id == f"todo-claim:codex-capture:{digest}"
+        original = projected_read(request["receipt_command"])
     lease = original["receipts"][0]["result"]["lease"]
     if released:
         read("task-lease", "release", "--goal-id", GOAL, "--todo-id", TODO, "--owner", AGENT,
             "--expected-version", str(lease["version"]), "--idempotency-key", lease["idempotency_key"])
 
     unverified_copy = case in ("reencoded-released-execution", "legacy-marked-released-execution")
+    signed_tamper = (
+        case == "legacy-marked-released-execution"
+        and json.loads(original_bytes).get("schema_version") == "loopx_turn_envelope_v1"
+    )
     if legacy or unverified_copy:
         presented_capture = capture
         if unverified_copy:
@@ -711,16 +742,23 @@ def test_native_hook_replays_the_original_claim_after_guard_timeout(
             else:
                 copy.write_bytes(original_bytes + b" ")
             copy.chmod(0o600)
-        presented_digest = _present_saved_guard(tmp_path, native, presented_capture, "codex_app_heartbeat", turn)
+        presented_digest = _present_saved_guard(
+            tmp_path, native, presented_capture, "codex_app_heartbeat", turn,
+            refused_receipt=before["heartbeat_receipt"] if signed_tamper else None,
+        )
         assert (presented_digest != digest) == unverified_copy
     result = hook()
     resume = hook("SessionStart")
     current = read("task-lease", "inspect", "--goal-id", GOAL, "--todo-id", TODO)
     assert source.read_bytes() == original_bytes
     if legacy or unverified_copy:
-        guidance = result["hookSpecificOutput"]["additionalContext"]
-        assert "no verified live guard binding" in guidance and "fresh capture" in guidance
-        assert "host_execution_prepared" not in guidance
+        if signed_tamper:
+            # A rejected complete capture must retire the moving recovery lookup.
+            assert result == resume == {}
+        else:
+            guidance = result["hookSpecificOutput"]["additionalContext"]
+            assert "no verified live guard binding" in guidance and "fresh capture" in guidance
+            assert "host_execution_prepared" not in guidance
         assert len(claims) == len(guards) == (0 if legacy else 1)
         assert current["active"] is (not released)
         assert current["lease"]["lease_epoch"] == lease["lease_epoch"]
@@ -738,11 +776,8 @@ def test_native_hook_replays_the_original_claim_after_guard_timeout(
             )
             if after_ready:
                 assert receipt["context"]["recovery_command"]
-        for command_key in ("receipt_command", "lease_command"):
-            proc = subprocess.run(
-                shlex.split(receipt[command_key]), cwd=tmp_path, capture_output=True, text=True, check=True,
-            )
-            assert json.loads(proc.stdout)["ok"]
+        assert projected_read(receipt["receipt_command"])["receipts"] == original["receipts"]
+        assert projected_read(receipt["lease_command"]) == current
         if released:
             assert not current["active"] and current["lease"]["lease_epoch"] == lease["lease_epoch"]
         else:

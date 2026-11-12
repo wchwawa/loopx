@@ -558,7 +558,7 @@ def test_preflight_instruction_pins_projection_and_diagnostic_receipt(tmp_path):
     (True, False, "explicit-root"),
 ], ids=["off", "on", "on-after-compaction", "alias-before-session", "explicit-before-session", "explicit-root"])
 def test_checkpoint_preflight_selection_inherits_native_transport(tmp_path, monkeypatch, provider, enabled, compacted, placement):
-    """The saved guard is presented after SessionStart, then really bound once."""
+    """Execute same-Turn selection from the saved guard with and without SessionStart."""
     from benchmark.runtime.checkpoint import capture_before_replan
     from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime, read_fixture_todos
     from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
@@ -630,6 +630,8 @@ def test_checkpoint_preflight_selection_inherits_native_transport(tmp_path, monk
     else:
         source = wake / "checkpoint-start-view.json"
     raw = source.read_bytes()
+    if enabled:
+        assert raw == original_guard
     assert _heartbeat_receipt_count(runtime, turn) == 1 and _spend_run_count(runtime) == 0
     assert not list(native.iterdir())  # Host preflight must not publish before native SessionStart.
 
@@ -734,13 +736,13 @@ def test_checkpoint_preflight_selection_inherits_native_transport(tmp_path, monk
 def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, monkeypatch, host):
     from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime, read_fixture_todos
     from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
-    from loopx.control_plane.quota.turn_envelope import prepare_context_delivery, restore_context_delivery
+    from loopx.control_plane.quota.turn_envelope import assert_complete_turn_decision, restore_context_delivery
+    from loopx.control_plane.turn_driver.decision_capture import read_context_capture_file
     from tests.control_plane.codex_checkpoint_fixture import (
-        last_context_page, local_inference_provider, native_process_continuation,
+        delivered_context, last_context_page, local_inference_provider, native_process_continuation,
         selected_context_values,
     )
     from tests.control_plane.test_codex_context_boundary import _app_server, _configure_provider, _native_fixture, _input_text
-    from tests.control_plane.test_codex_context_capture import _delivered
     from tests.control_plane.test_quota_settlement_cli import (
         AGENT_ID, GOAL_ID, TODO_ID, _configure_selectable_alternative,
         _write_fixture, _spend_run_count, _heartbeat_receipt_count,
@@ -770,16 +772,35 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
         build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=todos, handoff_mode="soft_claim"),
         state_path=state, provider="sqlite")
     sources = []
+    guard = ("quota", "should-run", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+        "--todo-id", TODO_ID, "--turn-instance-id", "saved-native-turn", "--codex-app")
     for name in (() if benchmark else ("cold", "warm")):
-        code, decision = _run_cli(registry, runtime, "quota", "should-run", "--goal-id", GOAL_ID,
-            "--agent-id", AGENT_ID, "--todo-id", TODO_ID, "--turn-instance-id", "saved-native-turn", "--codex-app", cwd=project)
-        assert code == 0, decision
         if large_capture:
-            # Unknown supporting fields are part of the saved capture's
-            # forward-compatible lossless contract. Only the requested field
-            # should enter model input; the full material must remain recoverable.
-            decision["retained_material"] = {
-                "requirement": unicode_requirement, "supporting": supporting_material}
+            from contextlib import redirect_stdout
+            from io import StringIO
+
+            from loopx.cli import main
+            from loopx.cli_commands import quota
+
+            prepare = quota._prepare_quota_result_context
+
+            def prepare_large_source(payload, *args, **kwargs):
+                # The actual producer must bind the optional material into
+                # its decision before the test saves the original capture.
+                return prepare({**payload, "retained_material": {
+                    "requirement": unicode_requirement, "supporting": supporting_material}},
+                    *args, **kwargs)
+
+            output = StringIO()
+            with monkeypatch.context() as fixture_patch, redirect_stdout(output):
+                fixture_patch.chdir(project)
+                fixture_patch.setattr(quota, "_prepare_quota_result_context", prepare_large_source)
+                code = main(["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                    *guard, "--context-delivery", "off"])
+            decision = json.loads(output.getvalue())
+        else:
+            code, decision = _run_cli(registry, runtime, *guard, cwd=project)
+        assert code == 0, decision
         source = workspace / (name + "-source.json")
         source.write_text(json.dumps(decision, ensure_ascii=False))
         if large_capture:
@@ -964,8 +985,8 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                         argv[index] = str(damaged)
                         queue.insert(0, shlex.join(argv))
                         rejected_read = True
-                if benchmark and progressive and name in ("cold", "warm"):
-                    queue.clear()  # The first tool result already contains the requested facts.
+                # The initial explicit selection contains only Goal and receipt.
+                # Read the offered choices and selection command before choosing.
                 phase = name + "_read"
                 if not queue:
                     return response(request, number, message)
@@ -1003,7 +1024,7 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                         assert page["next_offset"] > page["offset"] and page["next_command"]
                         queue.append(page["next_command"])
                         return response(request, number, message)
-                    assert _delivered(request, descriptor["sha256"]) == Path(descriptor["path"]).read_text().rstrip("\n")
+                    assert delivered_context(request, descriptor["sha256"]) == Path(descriptor["path"]).read_text().rstrip("\n")
                 if benchmark and name in ("cold", "warm"):
                     # Consume the command actually delivered to the native
                     # worker, rather than manually supplying missing flags.
@@ -1057,7 +1078,7 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
             errors.append(error)
             return message
 
-    with local_inference_provider(response) as (url, _, _):
+    with local_inference_provider(response) as (url, _, provider_requests):
         if benchmark:
             from benchmark.runtime.worker import run_once
             skills = workspace / "skills"
@@ -1105,6 +1126,9 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                 config.write_text(config.read_text().replace("[features]\n", "[features]\ncode_mode=true\n"))
             _app_server(binary, env, workspace, home, True, sandbox="workspace-write")
     assert not errors and phase == "done", (errors, phase, wrong_runtime.exists())
+    if large_capture:
+        assert all("资料🙂" not in json.dumps(request["input"], ensure_ascii=False)
+            for request in provider_requests)
     if force_async:
         assert async_observed and read_gate.is_file()
     if routed_program:
@@ -1118,48 +1142,83 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
         assert _spend_run_count(runtime) == 1  # only the explicit inter-wake settlement above
     else:
         assert _heartbeat_receipt_count(runtime, "saved-native-turn") == receipts and _spend_run_count(runtime) == 0
+    def checked_body(reference):
+        return read_context_capture_file(reference["path"], reference["sha256"], private=True)[2]
+
     cold = observed["cold"][0]
-    baseline = None
-    for published, descriptor in observed.values():
-        projected = json.loads(Path(descriptor["recovery"]["path"]).read_text())
-        current = prepare_context_delivery(projected,
-            scope={key: descriptor["target"][key] for key in
-                ("goal_id", "agent_id", "session_id", "context_epoch", "continuity_generation") if key in descriptor["target"]},
-            capture_id=descriptor["target"]["capture_id"], surface="quota_packet")
-        # Full presentation publishes the original document; only deltas have
-        # a separate wire target. Both retain the same typed recovery check.
-        wire = current if descriptor["mode"] == "full" else published
-        assert current["target"] == descriptor["target"]
-        restored = restore_context_delivery(wire, baseline=baseline, current=current)
-        assert restored["context"] == projected
+    previous = None
+    signed_sources = {}
+    for name, (published, descriptor) in observed.items():
+        projected = checked_body(descriptor["recovery"])
+        if projected.get("schema_version") == "loopx_turn_envelope_v1":
+            details = projected.get("context_details", {})
+            reference = details.get("unread_context_index", {}).get("source")
+            if reference is None and (reader := details.get("command_template")):
+                argv = shlex.split(reader)
+                reference = {"path": argv[argv.index("--capture-file") + 1],
+                             "sha256": argv[argv.index("--capture-sha256") + 1]}
+            signed = checked_body(reference) if reference else projected
+            assert_complete_turn_decision(signed)
+            assert signed["contract_binding"] == projected["contract_binding"]
+            assert signed["heartbeat_receipt"] == projected["heartbeat_receipt"]
+            signed_sources[name] = signed
         if large_capture:
-            assert restored["context"]["retained_material"] == {
+            assert descriptor["mode"] == "full"
+            if "target" in descriptor:
+                assert descriptor["target"]["goal_id"] == GOAL_ID
+                assert descriptor["target"]["agent_id"] == AGENT_ID
+            assert published == projected
+            assert projected["retained_material"] == {
                 "requirement": unicode_requirement, "supporting": supporting_material}
+            continue
+        # The pinned full presentation has its own digest and target; a signed
+        # decision authenticates the source, not the transported presentation.
+        current = {"schema_version": "context_delivery_v1", "mode": "full", "target": descriptor["target"],
+                   "ancestry": 0, "context": projected}
+        if descriptor["mode"] == "full":
+            assert published == projected
+            wire, base = current, None
+        else:
+            wire, base = published, previous
+            if wire.get("continuity_basis") == "captured_file":
+                base = {**current, "target": wire["base"], "context": checked_body(descriptor["baseline_reference"])}
+        restored = restore_context_delivery(wire, baseline=base, current=current)
+        assert restored["target"] == descriptor["target"] and restored["context"] == projected
+        assert restored["mode"] == descriptor["mode"]  # Full fallback would hide a broken delta.
         if wire["mode"] == "delta":
-            assert restored["mode"] == "delta"  # A fallback would hide a broken baseline chain.
-        # Match the native journal's exact prior full capture and depth. The
-        # reconstructed mapping need not preserve that capture's field order.
-        baseline = {**current, "ancestry": 0 if wire.get("continuity_basis") == "captured_file" else wire["ancestry"]}
+            corrupted = {**wire, "changes": {"value": {}}}
+            for rejected, candidate in ((wire, None), (corrupted, base)):
+                fallback = restore_context_delivery(rejected, baseline=candidate, current=current)
+                assert fallback["mode"] == "full" and fallback["reason"] == "automatic_full_recovery"
+                assert fallback["target"] == current["target"] and fallback["context"] == projected
+        previous = {**current, "ancestry": 0 if wire.get("continuity_basis") == "captured_file" else wire["ancestry"]}
     if benchmark:
-        for name, (_, raw) in zip(("cold", "warm"), sources):
-            presentation = json.loads(Path(observed[name][1]["recovery"]["path"]).read_text())
+        for name, (source_path, raw) in zip(("cold", "warm"), sources, strict=True):
+            presentation = checked_body(observed[name][1]["recovery"])
             original = json.loads(raw)
+            if original.get("schema_version") == "loopx_turn_envelope_v1":
+                assert signed_sources[name] == original
             selected = presentation["interaction_contract"]["cli_channel"]["selection_command"]
             original_command = original["interaction_contract"]["cli_channel"]["selection_command"]["command_args_template"]
             words = shlex.split(selected["command_args_template"])
             original_words = shlex.split(original_command)
+            output_root = source_path.parents[1] if "--decision-output-root" in original_words else home / "loopx-context"
             transport = {
-                "--decision-output-root": str(home / "loopx-context"),
+                "--decision-output-root": str(output_root),
                 "--context-delivery": "on",
                 "--delta-delivery": "auto",
                 "--codex-context-dir": str(home / "loopx-context"),
                 "--max-page-output-bytes": "32000",
             }
             for option, value in transport.items():
-                assert option not in original_words and words.count(option) == 1
+                assert words.count(option) == 1
                 index = words.index(option)
                 assert words[index + 1] == value
-                del words[index:index + 2]
+                if option in original_words:
+                    assert original_words.count(option) == 1
+                    assert original_words[original_words.index(option) + 1] == value
+                else:
+                    del words[index:index + 2]
             assert words == original_words
             selected["command_args_template"] = original_command
             # Main already deduplicates identical Todo rows within this exact
@@ -1175,6 +1234,13 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                         value = value[int(part)] if isinstance(value, list) else value[part]
                     assert "context_ref" not in value
                     rows[i] = value
+            if "context_reference_instruction" in presentation and "context_details" not in original:
+                details = presentation.pop("context_details")
+                assert set(details) == {"command_template"}
+                reader = shlex.split(details["command_template"])
+                signed_source = Path(reader[reader.index("--capture-file") + 1]).read_bytes()
+                assert hashlib.sha256(signed_source).hexdigest() == reader[reader.index("--capture-sha256") + 1]
+                assert json.loads(signed_source) == original
             presentation.pop("context_reference_instruction", None)
             assert presentation == original  # only presentation transport differs
     else:
