@@ -157,7 +157,8 @@ unless the gate asks for a consult. A deterministic rule set decides this
 without a model call. It consults the Controller when:
 
 - several authoritative results arrived without a new best
-  (`authoritative_plateau`);
+  (`authoritative_plateau`), or every authoritative attempt so far failed
+  (`no_valid_authoritative_result`);
 - a proxy measure ranks candidates against the authoritative one, using the
   shared scoped-fidelity operator (`proxy_order_reversed`);
 - the Worker returned quickly twice with no new measurement (`worker_idle`).

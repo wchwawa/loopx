@@ -174,10 +174,11 @@ def decide(
         if state.get("plateau_best_sequence") != best_sequence:
             state["plateau_best_sequence"], state["plateau_consulted_at"] = best_sequence, 0
         stalled = summary["results_since_best"]
-        if (summary["best"] is not None
-                and stalled - state.get("plateau_consulted_at", 0) >= policy.plateau_results):
+        if stalled - state.get("plateau_consulted_at", 0) >= policy.plateau_results:
             state["plateau_consulted_at"] = stalled
-            return GateDecision("consult", "authoritative_plateau", facts)
+            # With no incumbent at all, every authoritative attempt so far failed.
+            reason = "authoritative_plateau" if summary["best"] is not None else "no_valid_authoritative_result"
+            return GateDecision("consult", reason, facts)
         reversed_proxy = _reversed_fidelity(evidence, evaluate_fidelity)  # type: ignore[arg-type]
         if reversed_proxy is not None and state.get("fidelity_consulted") != reversed_proxy:
             state["fidelity_consulted"] = reversed_proxy

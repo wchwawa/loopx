@@ -46,8 +46,13 @@ def test_plateau_consults_once_until_more_results_arrive():
 
 def test_lower_is_better_direction_and_no_valid_incumbent():
     state = {}
+    assert decide(snapshot([None, None]), state).action == "continue"
+    # Every authoritative attempt failed: decision-relevant even without an incumbent.
+    failed = decide(snapshot([None, None, None]), state)
+    assert (failed.action, failed.reason) == ("consult", "no_valid_authoritative_result")
+    assert failed.facts["authoritative"]["best"] is None
     assert decide(snapshot([None, None, None, None]), state).action == "continue"
-    assert decide(snapshot([10.0, 9.0, 8.0, 7.0], higher=False), state).action == "continue"
+    assert decide(snapshot([10.0, 9.0, 8.0, 7.0], higher=False), {}).action == "continue"
     assert decide(snapshot([10.0, 9.0, 9.5, 9.0, 12.0], higher=False), {}).reason == "authoritative_plateau"
 
 
