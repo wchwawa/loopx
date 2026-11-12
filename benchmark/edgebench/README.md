@@ -207,7 +207,27 @@ artifact paths, the Controller can request further work on the original Worker
 session while the admission and phase budget remain live, or send its receipt
 to Core. Both roles use `codex exec` and resume by exact session ID.
 The guest needs a kernel that supports the native Codex CLI filesystem sandbox.
-The sandbox enforces the two roles' file and tool grants at execution.
+The sandbox enforces the two roles' file and tool grants at execution. In this
+default form the Worker has no network and cannot run `sforge-submit`, so it
+receives no native score during the phase.
+
+Add `--controller-gate evidence` or `--controller-gate never` to keep one
+Worker working for the whole phase, as the official solver does. The Worker
+then receives the pinned task file first with no Controller turn before it,
+runs under the trial's own grant so it can call `sforge-submit`, and is resumed
+on the same session after each return. Between returns the Host reads the
+solver-visible submission history (`benchmark/runtime/native_evidence.py`, no
+model call and no evaluation slot). `evidence` consults the Controller only
+when completed native results stop improving or the Worker returns idle;
+`never` consults it once for the Turn receipt and isolates the effect of the
+continuous Worker. These modes need no nested sandbox in the guest. Both roles
+then share the task container's boundary, and the Controller is read-only by
+instruction. `gate_decisions` in the role record lists every decision with its
+reason, so each Controller intervention can be matched to the native results
+that followed it. Compare all three gate values and `official` under the same
+task, model, effort, cooldown and phase budget. The gate reads native results
+only; it holds no opinion on a local proxy unless the evidence source supplies
+proxy measurements.
 
 From the heartbeat trial entry, specify
 `--worker heartbeat-resume --turn-topology single-worker` or `--worker heartbeat-resume --turn-topology controller-worker` and

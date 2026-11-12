@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -297,7 +298,8 @@ def pending_turn(path: Path, turn_id: str, execution: Execution) -> dict:
         atomic_write_private_json(path, pending)
         return pending
     pending = read_json(path.read_text())
-    if pending.get("turn_topology") != validator.get("turn_topology"):
+    if (pending.get("turn_topology") != validator.get("turn_topology")
+            or pending.get("controller_gate") != validator.get("controller_gate")):
         raise ValueError("Pending Turn requires its original worker topology")
     if pending.get("validation_argv_sha256") != validator["validation_argv_sha256"]:
         raise ValueError("Pending Turn requires its original validation command")
@@ -323,6 +325,13 @@ def turn_command(
         host.extend(["--topology", "controller-worker"])
         if env.get("LOOPX_TASK_DOC"):
             host.extend(["--task-material", env["LOOPX_TASK_DOC"]])
+        if execution.controller_gate != "every-return":
+            # One Worker keeps working with the trial's own grant, as the
+            # official solver does, so it can reach the native evaluator. The
+            # Host reads the same solver-visible history between returns.
+            evidence = [sys.executable, str(Path(__file__).with_name("native_evidence.py"))]
+            host.extend(["--controller-gate", execution.controller_gate, "--role-isolation", "caller",
+                         "--evidence-command-json", json.dumps(evidence)])
     return loopx_command(env) + [
         "turn",
         "run-once",
@@ -531,6 +540,7 @@ def run_once(env: dict[str, str]) -> dict:
         raise ValueError("unknown governed Turn topology")
     execution = Execution(
         controller_worker=topology == "controller-worker",
+        controller_gate=env.get("LOOPX_CONTROLLER_GATE") or "every-return",
         mode=env.get("LOOPX_EXECUTION_MODE", "heartbeat"),
         context=env.get("LOOPX_ITERATION_CONTEXT"),
         sandbox=env.get("LOOPX_CODEX_SANDBOX", "danger-full-access"),

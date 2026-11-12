@@ -85,6 +85,7 @@ class BenchmarkCodex(CodexOffline):
         agent_id=_AGENT_ID,
         defer_codex_home=False,
         complete_turn=False,
+        controller_gate="every-return",
         **kwargs,
     ):
         if "research_loop" in kwargs:
@@ -107,6 +108,7 @@ class BenchmarkCodex(CodexOffline):
             native_child_limit,
             complete_turn=complete_turn,
             controller_worker=controller_worker,
+            controller_gate=controller_gate,
         )
         if type(provider_request_admission) is not bool:
             raise ValueError("provider_request_admission must be a boolean opt-in")
@@ -321,7 +323,8 @@ class BenchmarkCodex(CodexOffline):
     async def install(self, environment: BaseEnvironment) -> None:
         await self._capture_task_path(environment)
         await super().install(environment)
-        if self.execution.controller_worker:
+        if self.execution.controller_worker and self.execution.controller_gate == "every-return":
+            # Gated roles run under the trial's own grant and need no nested sandbox.
             # Probe the staged CLI as the actual solver user before loading
             # trial credentials or paying for a role that cannot run tools.
             probe = await environment.exec(
@@ -722,6 +725,7 @@ class BenchmarkCodex(CodexOffline):
                 "LOOPX_ITERATION_CONTEXT": self.execution.context,
                 "LOOPX_CODEX_SANDBOX": self.execution.sandbox,
                 "LOOPX_TURN_TOPOLOGY": "controller-worker" if self.execution.controller_worker else "single-worker",
+                "LOOPX_CONTROLLER_GATE": self.execution.controller_gate,
                 "LOOPX_VALIDATION_COMMAND_JSON": json.dumps(
                     self.execution.validation_command
                 ),

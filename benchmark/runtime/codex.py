@@ -18,6 +18,9 @@ MODES = ("plain", "native-goal", "heartbeat", "turn", "loopx-goal")
 CONTEXTS = ("fresh", "resume")
 TASK_ENTRIES = ("seeded-todo", "loopx-planned")
 SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+# every-return: the Controller reviews each Worker return. evidence: only when
+# measured results change the choice. never: only for the final typed result.
+CONTROLLER_GATES = ("every-return", "evidence", "never")
 
 
 @dataclass(frozen=True)
@@ -33,8 +36,12 @@ class Execution:
     native_child_limit: int | None = None
     complete_turn: bool = False
     controller_worker: bool = False
+    controller_gate: str = "every-return"
 
     def __post_init__(self) -> None:
+        if self.controller_gate not in CONTROLLER_GATES or (
+                self.controller_gate != "every-return" and not self.controller_worker):
+            raise ValueError("a Controller gate requires the controller-worker topology")
         if self.native_child_limit is not None and (
             type(self.native_child_limit) is not int or self.native_child_limit < 1
         ):
@@ -85,7 +92,8 @@ class Execution:
             return {}
         encoded = json.dumps(self.validation_command, separators=(",", ":")).encode()
         return {"validation_argv_sha256": hashlib.sha256(encoded).hexdigest(),
-                **({"turn_topology": "controller-worker"} if self.controller_worker else {})}
+                **({"turn_topology": "controller-worker"} if self.controller_worker else {}),
+                **({"controller_gate": self.controller_gate} if self.controller_gate != "every-return" else {})}
 
     @property
     def uses_loopx(self) -> bool:

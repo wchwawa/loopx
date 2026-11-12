@@ -47,12 +47,13 @@ _RUNTIME_CREDENTIAL_PLACEHOLDER = "runtime-managed-credential"
 
 def profile_execution(profile, *, task_entry=None, context_delivery=None,
                       turn_envelope=False, complete_turn=False,
-                      validation_command=None, native_child_limit=None):
+                      validation_command=None, native_child_limit=None, controller_gate=None):
     """Resolve the native experiment arm through the shared runtime contract."""
     if profile not in PROFILE_MODES:
         raise ValueError("Unknown benchmark worker profile")
     return Execution(
         mode=PROFILE_MODES[profile], controller_worker=profile == "turn-controller-worker",
+        **({} if controller_gate is None else {"controller_gate": controller_gate}),
         task_entry=task_entry, context_delivery=context_delivery,
         turn_envelope=turn_envelope, complete_turn=complete_turn, native_child_limit=native_child_limit,
         validation_command=() if validation_command is None else validation_command,
@@ -132,13 +133,14 @@ class SForgeWorker(CodexAgent):
                  checkpoint_request_path: str | None = None,
                  checkpoint_request: bytes | None = None,
                  warm_start=None, research_sidecar: bool = False,
-                 native_result_scope: dict | None = None, complete_turn: bool = False):
+                 native_result_scope: dict | None = None, complete_turn: bool = False,
+                 controller_gate: str | None = None):
         super().__init__(config)
         self.execution = profile_execution(
             profile, task_entry=task_entry,
             context_delivery=context_delivery, turn_envelope=turn_envelope,
             complete_turn=complete_turn, validation_command=validation_command,
-            native_child_limit=native_child_limit,
+            native_child_limit=native_child_limit, controller_gate=controller_gate,
         )
         self.turn_envelope = self.execution.turn_envelope
         self.context_delivery = self.execution.context_delivery
@@ -420,6 +422,8 @@ class SForgeWorker(CodexAgent):
                 **common, execution_mode=self.execution.mode,
                 iteration_context=self.execution.context,
                 controller_worker=self.execution.controller_worker,
+                **({"controller_gate": self.execution.controller_gate}
+                   if self.execution.controller_gate != "every-return" else {}),
                 validation_command=self.execution.validation_command,
                 turn_timeout_sec=None,
                 scheduler_timeout_sec=self.timeout_seconds,
