@@ -82,3 +82,7 @@ def test_benchmark_turn_command_selects_the_gate_once():
     assert Execution(mode="turn", controller_worker=True, controller_gate="never",
                      validation_command=check).validation_receipt()["controller_gate"] == "never"
     assert CONTROLLER_GATES == gate.GATE_MODES
+    # The gated Worker starts from the original task; the default profile still plans first.
+    entries = {mode: Execution(mode="turn", controller_worker=True, controller_gate=mode,
+                               validation_command=check).task_entry for mode in CONTROLLER_GATES}
+    assert entries == {"every-return": "loopx-planned", "evidence": "seeded-todo", "never": "seeded-todo"}

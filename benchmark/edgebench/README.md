@@ -212,7 +212,8 @@ default form the Worker has no network and cannot run `sforge-submit`, so it
 receives no native score during the phase.
 
 Add `--controller-gate evidence` or `--controller-gate never` to keep one
-Worker working for the whole phase, as the official solver does. The Worker
+Worker working for the whole phase, as the official solver does. These modes
+default to `--task-entry seeded-todo`, so no planning wake runs first. The Worker
 then receives the pinned task file first with no Controller turn before it,
 runs under the trial's own grant so it can call `sforge-submit`, and is resumed
 on the same session after each return. Between returns the Host reads the

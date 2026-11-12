@@ -64,7 +64,10 @@ class Execution:
         if self.mode not in MODES or self.context not in CONTEXTS:
             raise ValueError("unsupported execution mode or iteration context")
         if self.task_entry is None:
-            object.__setattr__(self, "task_entry", "loopx-planned" if self.uses_loopx else "seeded-todo")
+            # A gated Worker starts from the original task itself, so a planning
+            # wake before it would only add cost and unread Todos.
+            planned = self.uses_loopx and self.controller_gate == "every-return"
+            object.__setattr__(self, "task_entry", "loopx-planned" if planned else "seeded-todo")
         if self.task_entry not in TASK_ENTRIES:
             raise ValueError("unsupported task entry")
         if self.task_entry == "loopx-planned" and not self.uses_loopx:
