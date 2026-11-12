@@ -127,6 +127,73 @@ An interactive Codex App heartbeat or an existing Chat/Steward connection owns
 its current conversation. Adopting this profile there requires an authorized
 secondary execution surface and result return to the original conversation.
 
+### Keep one Worker working and gate Controller attention
+
+By default the Controller reviews every Worker return. For open-ended work
+whose progress is measured outside the conversation, a caller can keep one
+Worker advancing and spend Controller attention only where measurements change
+the choice:
+
+```sh
+loopx turn run-once --execute --prepare-selected-todo --goal-id GOAL --agent-id AGENT \
+  --project "$PWD" --host codex-cli --execution-mode isolated-headless \
+  --topology controller-worker --task-material TASK.md --timeout-seconds 3600 \
+  --controller-gate evidence --evidence-command-json '["./read-results"]' \
+  --codex-sandbox workspace-write --validation-command-json '["./check-work"]'
+```
+
+`--controller-gate` takes three values:
+
+| Value | Controller turns |
+| --- | --- |
+| `every-return` (default) | Before the first dispatch and after each Worker return. |
+| `evidence` | When the gate fires, and once for the typed result. |
+| `never` | Once, for the typed result. |
+
+With `evidence` or `never` the Worker receives `--task-material` verbatim as
+its first input, with no Controller turn in front of it. After each Worker
+return the Host resumes the same Worker thread with a one-line continuation
+unless the gate asks for a consult. A deterministic rule set decides this
+without a model call. It consults the Controller when:
+
+- several authoritative results arrived without a new best
+  (`authoritative_plateau`);
+- a proxy measure ranks candidates against the authoritative one, using the
+  shared scoped-fidelity operator (`proxy_order_reversed`);
+- the Worker returned quickly twice with no new measurement (`worker_idle`).
+
+Each trigger fires once per piece of new evidence, so a standing plateau does
+not interrupt the Worker again until more results arrive. A consult gives the
+Controller the original contract, the measured facts and the latest Worker
+report. It answers with a redirection for the Worker, `continue`, or the typed
+result. Near the deadline the Host reserves time and asks the Controller for
+the typed result (`deadline_reserve`). A failed native Worker turn resumes the
+same thread with bounded backoff while budget remains.
+
+`--evidence-command-json` names a trusted argv that the Host runs after each
+Worker return. It prints one `turn_worker_evidence_v0` object:
+
+```json
+{"schema_version": "turn_worker_evidence_v0", "higher_is_better": true,
+ "measurements": [{"candidate_ref": "s1", "value": 41.5, "valid": true,
+                   "authoritative": true, "sequence": 0}]}
+```
+
+A missing, failing or malformed snapshot never stops the work: the gate then
+has no measurement triggers and records `evidence_error`. Every gate decision,
+with its reason and facts, is appended to `gate_decisions` in the private
+`turns/controller-worker/` record beside the per-role usage, so Controller cost
+and each intervention can be audited separately from Worker cost.
+
+`--role-isolation caller` runs both roles under the caller's own
+`--codex-sandbox` grant and environment, with no nested workspace sandbox. Use
+it only inside a disposable boundary, such as a benchmark task container, whose
+evaluator tools live outside the workspace or whose kernel cannot nest a
+sandbox. The Controller is then read-only by instruction, and
+`--controller-material` is unavailable because the Worker could read it. Gate,
+evidence command and isolation are part of the admitted Host configuration:
+recovery under a different choice is held, like a changed topology.
+
 ## Generic Agent CLI Quick Start
 
 An agent CLI does not need native LoopX support. It needs a thin host adapter

@@ -1162,6 +1162,42 @@ owners. Each PR records its replaced caller, the new observable outcome, the
 evidence and the rollback. The preview introduces no second authority store or
 separate user ingress.
 
+<a id="evidence-gated-controller-attention"></a>
+
+**Evidence-gated attention checkpoint (source and controlled-backend only).**
+The first two-role provider consulted the Controller before the first dispatch
+and after every Worker return, and confined the Worker so tightly that it could
+not reach an external evaluator. Its own open-search diagnostic scored lower
+than one Worker, with no Controller feedback on any intermediate candidate.
+The provider now offers `--controller-gate evidence|never` for open-ended work
+measured outside the conversation:
+
+- **Worker.** One native session receives the caller's task first, verbatim,
+  and is resumed after each return with a one-line continuation. It carries no
+  Core contract. A failed native turn resumes the same session with bounded
+  backoff.
+- **Gate.** After each return the Host reads a caller-supplied
+  `turn_worker_evidence_v0` snapshot and decides without a model call. Ordinary
+  returns cost no Controller tokens. A consult fires on an authoritative
+  plateau, a proxy that ranks against the authoritative measure (through the
+  shared scoped-fidelity operator), or an idle Worker, once per piece of new
+  evidence.
+- **Controller.** On a consult it receives the contract, the measured facts and
+  the latest report, and answers with a redirection, `continue` or the typed
+  result. It always authors the Core receipt at the deadline reserve. `never`
+  keeps only that last turn, which separates the effect of a continuous Worker
+  from the effect of Controller judgment.
+
+Every decision is recorded with its reason and facts beside per-role usage.
+The default `every-return` behaviour, the admitted configuration identity and
+recovery are unchanged. This checkpoint runs the real Codex CLI against a
+controlled inference backend with a SQLite authority store. It does not
+establish a native-score or cost benefit: the matched comparison in step 2,
+with `official`, single-worker and all three gate values under frozen budgets,
+is still required before any default changes. `--role-isolation caller`, which
+the benchmark guest needs, removes nested confinement and is suitable only
+inside a disposable boundary. See the [Turn contract](../../reference/protocols/loopx-turn-v0.md#keep-one-worker-working-and-gate-controller-attention).
+
 <a id="superagent-acceptance"></a>
 
 ### When this qualifies as a Superagent practice

@@ -929,6 +929,30 @@ judge 评分。分别记录最后验证的分数、黑盒调用次数、完整 t
 沿用已有的 request、session、Turn 和产品 owner。每个 PR 记录被替换的调用方、新的可观察
 结果、验证证据和回退办法。预览沿用同一份权威状态和用户入口。
 
+<a id="evidence-gated-controller-attention"></a>
+
+**按证据介入的检查点（仅源码与受控后端验证）。** 首个双角色 provider 在首次派发前和每次
+Worker 返回后都调用 Controller，并把 Worker 限制到无法访问外部评测器。它自己的开放搜索
+诊断得分低于单 Worker，期间没有任何中间候选得到 Controller 反馈。provider 现在为
+"进展在会话之外被测量"的开放式工作提供 `--controller-gate evidence|never`：
+
+- **Worker。** 一个原生会话首先原样收到调用方的任务，每次返回后用一行续跑指令恢复，
+  不携带 Core 契约。原生轮次失败时在同一会话上按有界退避恢复。
+- **证据门。** 每次返回后，Host 读取调用方提供的 `turn_worker_evidence_v0` 快照，不调用
+  模型就做出判断。普通返回不消耗 Controller token。权威结果进入平台期、代理标尺与权威
+  指标排序相反（复用共用的 scoped-fidelity 算子）或 Worker 空转时触发咨询，同一份新证据
+  只触发一次。
+- **Controller。** 被咨询时收到契约、测量事实和最新报告，回答改向指令、`continue` 或
+  类型化结果。到达截止预留时由它产出 Core 回执。`never` 只保留这最后一轮，用来把
+  "Worker 连续工作"的效果与"Controller 判断"的效果分开。
+
+每次判断连同原因和事实记录在各角色用量旁。默认的 `every-return` 行为、已准入配置的身份
+和恢复方式不变。本检查点用真实 Codex CLI、受控推理后端和 SQLite 权威存储运行，不证明
+原生分或成本收益：第 2 步的同条件对照仍是修改任何默认值的前提，对照需包含 `official`、
+单 Worker 和三种门取值，并冻结预算。基准 guest 所需的 `--role-isolation caller` 去掉了
+嵌套隔离，只适合可丢弃的边界之内。详见
+[Turn 契约](../../reference/protocols/loopx-turn-v0.md#keep-one-worker-working-and-gate-controller-attention)。
+
 <a id="superagent-acceptance"></a>
 
 ### 何时可以称为 Superagent 的实践
