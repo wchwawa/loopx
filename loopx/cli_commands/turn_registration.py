@@ -179,6 +179,17 @@ def register_turn_commands(
     material.add_argument("--task-material", type=Path, help="Original task for the Worker, forwarded verbatim after Controller dispatch.")
     material.add_argument("--controller-material", type=Path,
                           help="An additional UTF-8 task file for the Controller (up to 128 KiB, pinned at admission).")
+    run_once.add_argument("--controller-gate", choices=("every-return", "evidence", "never"), default="every-return",
+        help="When the Controller reviews Worker returns: after each one, only when measured evidence "
+             "changes the choice, or only for the final typed result. The last two keep one Worker "
+             "working on --task-material until the deadline reserve.")
+    run_once.add_argument("--evidence-command-json",
+        help="Trusted JSON argv run by the Host after each Worker return; prints a turn_worker_evidence_v0 "
+             "snapshot of measured results for the Controller gate.")
+    run_once.add_argument("--role-isolation", choices=("workspace", "caller"), default="workspace",
+        help="workspace: each role runs in its own nested project sandbox without network. caller: both "
+             "roles keep the caller's --codex-sandbox grant and environment with no nested sandbox, for a "
+             "disposable task container whose evaluator tools live outside the workspace.")
     run_once.add_argument("--project", required=True)
     run_once.add_argument("--prepare-selected-todo", action="store_true",
         help="On fresh execution, perform quota’s authorized ordinary claim and reread the same Todo before dispatch.")

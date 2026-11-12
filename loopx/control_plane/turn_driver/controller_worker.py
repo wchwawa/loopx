@@ -28,6 +28,7 @@ from loopx.control_plane.turn_driver.codex_cli import (
 )
 from loopx.control_plane.turn_driver.host_process_transport import HostOutputLines, run_host_process
 from loopx.control_plane.turn_driver.decision_capture import read_turn_observation_text
+from loopx.control_plane.turn_driver.evidence_gate import GATE_MODES, GatePolicy, decide, normalize_evidence
 from loopx.control_plane.turn_driver.executor import MATERIAL_HOST_RESULT_KINDS
 from loopx.control_plane.turn_driver.host_candidate import extract_turn_work_identity
 from loopx.control_plane.turn_driver.journal_store import turn_journal_path
@@ -45,6 +46,10 @@ def object_schema(fields):
 
 WORK_REPORT = object_schema({"finding": {"type": "string"},
                              "artifacts": {"type": "array", "items": {"type": "string"}}})
+ROLE_ISOLATIONS = ("workspace", "caller")
+CONTINUE_INSTRUCTION = "Continue working toward the task objective."
+_EVIDENCE_TIMEOUT_SECONDS = 30
+_WORKER_RETRY_BACKOFF_SECONDS = (5, 20, 60, 120, 300)
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,25 @@ class RoleHost:
     material_sha256: str | None = None
     goal_state: Path | None = None
     dispatch_task_material: bool = False
+    gate: str = "every-return"
+    evidence_command: tuple[str, ...] = ()
+    role_isolation: str = "workspace"
+
+    def __post_init__(self) -> None:
+        if self.gate not in GATE_MODES or self.role_isolation not in ROLE_ISOLATIONS:
+            raise ValueError("unknown Controller gate or Worker isolation")
+        if self.continuous and not self.dispatch_task_material:
+            # A continuous Worker starts from the caller's own task text; a
+            # Controller-only brief would need a Controller turn before any work.
+            raise ValueError("a gated Controller requires Worker-audience task material")
+        if self.role_isolation == "caller" and not self.dispatch_task_material:
+            # Without nested confinement the Worker can read what the Controller
+            # reads, so Controller-only material is not available in this mode.
+            raise ValueError("caller-level role access requires Worker-audience task material")
+
+    @property
+    def continuous(self) -> bool:
+        return self.gate != "every-return"
 
     @property
     def worker_writable(self) -> bool:
@@ -114,9 +138,21 @@ def toml_value(value: Any) -> str:
     return json.dumps(value)
 
 
+def role_sandbox(role: str, host: RoleHost) -> str | None:
+    """With caller isolation both roles run under the caller's own grant and
+    environment, without a nested workspace sandbox. The caller's outer
+    boundary (a disposable task container) is then the only confinement, and
+    the Controller is read-only by instruction rather than by enforcement."""
+    if host.role_isolation != "caller":
+        return None
+    return host.sandbox
+
+
 def role_cli_options(role: str, host: RoleHost, timeout: float) -> tuple[str, ...]:
-    _, config = role_policy(role, host)
-    if role == "worker" and host.worker_writable:
+    config: dict[str, Any] = {}
+    if role_sandbox(role, host) is None:
+        _, config = role_policy(role, host)
+    if role == "worker" and host.worker_writable and config:
         # Shell here-documents, compilers and tempfile users need scratch space.
         # Use the existing write grant; the shared system temp directory stays denied.
         shell = config["shell_environment_policy"]
@@ -185,10 +221,16 @@ class RoleTransport:
         with self.admission.launch_lifetime(operation="turn_role_continue"):
             pass
 
-    def send(self, role: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+    def send(self, role: str, prompt: str, schema: dict[str, Any], *,
+             reserve: float = 0.0) -> dict[str, Any] | None:
+        """Run one role turn. With ``reserve``, stop early enough to leave that
+        much of the Turn deadline to the caller and return None when cut."""
         threads = self.evidence["threads"]
         previous = threads.get(role)
         binding = self.evidence.get("host_models", {}).get(role)
+        budget = self.remaining() - reserve
+        if budget <= 0:
+            return None
         options = role_cli_options(role, self.host, self.remaining())
         if previous:
             if (self.evidence.get("transport") != "codex-exec" or not isinstance(binding, dict)
@@ -234,16 +276,22 @@ class RoleTransport:
                 schema_path, output = Path(temp) / "schema.json", Path(temp) / "result.json"
                 schema_path.write_text(json.dumps(schema), encoding="utf-8")
                 command = _codex_command(codex_bin=self.host.codex_bin, project=self.host.project,
-                    schema_path=schema_path, output_path=output, sandbox=None, model=binding["model"] if binding else self.host.model, reasoning_effort=self.host.effort, session_id=previous,
+                    schema_path=schema_path, output_path=output,
+                    sandbox=role_sandbox(role, self.host),
+                    model=binding["model"] if binding else self.host.model, reasoning_effort=self.host.effort, session_id=previous,
                     mcp_server=None, config_args=options)
                 events = HostOutputLines(observe)
                 diagnostics = HostOutputLines(failures.observe_stderr)
                 run = run_host_process(command, project=self.host.project, input_text=prompt,
-                    timeout_seconds=self.remaining(), on_stdout=events.feed, on_stderr=diagnostics.feed,
+                    timeout_seconds=min(budget, self.remaining()), on_stdout=events.feed, on_stderr=diagnostics.feed,
                     launch_guard=lambda: self.admission.launch_lifetime(operation="turn_role_turn_start"),
                     check_running=self.check_running)
                 events.finish()
                 diagnostics.finish()
+                if reserve > 0 and run["outcome"] == "timeout":
+                    # The caller's own reserve ended this turn; the thread keeps its work.
+                    step["native_status"] = "reserve_reached"
+                    return None
                 if (run["outcome"] != "exited" or run["returncode"] != 0 or not run["output_complete"]
                         or not events.complete or not completed or seen is None):
                     step["native_status"] = run["outcome"] if run["outcome"] != "exited" else "failed"
@@ -307,6 +355,137 @@ def run_roles(native, request, material=None, *, dispatch_task_material=False):
         if not worker_returned:
             prompt += "\nFor your Core receipt:\n" + "\n".join(codex_receipt_instructions())
         worker_returned = True
+
+
+def parse_evidence_command(text: str | None) -> tuple[str, ...]:
+    """A trusted argv chosen by the caller, the same shape as the validation command."""
+    if text is None:
+        return ()
+    argv = json.loads(text)
+    if (not isinstance(argv, list) or not argv or len(argv) > 32
+            or not all(isinstance(part, str) and part and len(part) <= 4096 for part in argv)):
+        raise ValueError("evidence command must be a non-empty JSON argv")
+    return tuple(argv)
+
+
+def gate_policy_for(timeout: float) -> GatePolicy:
+    """Scale the default reserves so short Turns keep most of their budget for work."""
+    base = GatePolicy()
+    return replace(base, final_reserve_seconds=min(base.final_reserve_seconds, timeout * 0.1),
+                   min_consult_remaining_seconds=min(base.min_consult_remaining_seconds, timeout * 0.15),
+                   idle_seconds=min(base.idle_seconds, timeout * 0.05))
+
+
+def read_worker_evidence(host: RoleHost) -> tuple[dict[str, Any] | None, str | None]:
+    """Run the caller's trusted evidence command. Missing evidence never stops the work."""
+    if not host.evidence_command:
+        return None, None
+    try:
+        done = subprocess.run(list(host.evidence_command), cwd=host.project, capture_output=True,
+                              timeout=_EVIDENCE_TIMEOUT_SECONDS)
+        if done.returncode:
+            return None, "evidence_command_failed"
+        if len(done.stdout) > 512 * 1024:
+            return None, "evidence_oversized"
+        return normalize_evidence(json.loads(done.stdout)), None
+    except subprocess.TimeoutExpired:
+        return None, "evidence_command_timeout"
+    except (OSError, ValueError):
+        return None, "evidence_unreadable"
+
+
+def evaluate_fidelity(params: dict[str, Any]) -> dict[str, Any]:
+    return effect_runtime_result("explore.yardstick_fidelity.evaluate", params)
+
+
+def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Callable[[], None],
+                    trail: dict[str, Any], read_evidence=read_worker_evidence, sleep=time.sleep, clock=time.monotonic):
+    """Keep one Worker advancing; spend Controller attention only when the gate asks.
+
+    The Worker receives the caller's task verbatim with no Controller turn in
+    front of it. After each Worker return the Host reads measured evidence and
+    decides without a model call. Ordinary returns resume the same Worker
+    thread immediately. A consult gives the Controller the evidence that fired
+    the gate; the deadline reserve asks it for the typed Core result.
+    """
+    controller_prompt, result_schema = prepare_codex_controller_input(request)
+    nullable_result = {"anyOf": [result_schema, {"type": "null"}]}
+    consult_schema = object_schema({"instruction": {"type": ["string", "null"]}, "result": nullable_result})
+    settle_schema = object_schema({"instruction": {"type": "null"}, "result": result_schema})
+    policy = gate_policy_for(host.timeout)
+    returns = trail.setdefault("worker_returns", [])
+    decisions = trail.setdefault("gate_decisions", [])
+    gate_state = trail.setdefault("gate_state", {})
+    instruction, briefed, measured, failures, report = material, False, 0, 0, None
+    while True:
+        began = clock()
+        try:
+            returned = native.send("worker", instruction, WORK_REPORT, reserve=policy.final_reserve_seconds)
+            failures = 0
+        except RuntimeError:
+            # A provider or transport fault ends one native turn, not the Turn:
+            # resume the same thread while the budget still allows useful work.
+            if (failures >= len(_WORKER_RETRY_BACKOFF_SECONDS) or not native.evidence["threads"].get("worker")
+                    or native.remaining() <= policy.final_reserve_seconds + _WORKER_RETRY_BACKOFF_SECONDS[failures]):
+                raise
+            sleep(_WORKER_RETRY_BACKOFF_SECONDS[failures])
+            failures += 1
+            returns.append({"elapsed_seconds": round(clock() - began, 3), "new_measurements": 0,
+                            "outcome": "retried_after_failure"})
+            save()
+            instruction = CONTINUE_INSTRUCTION
+            continue
+        if returned is not None:
+            if (not isinstance(returned.get("finding"), str) or not isinstance(returned.get("artifacts"), list)
+                    or not all(isinstance(path, str) for path in returned["artifacts"])):
+                raise ValueError("worker returned an invalid report")
+            report = returned
+        evidence, evidence_error = read_evidence(host)
+        count = len(evidence["measurements"]) if evidence is not None else measured
+        returns.append({"elapsed_seconds": round(clock() - began, 3),
+                        "new_measurements": max(0, count - measured),
+                        "outcome": "returned" if returned is not None else "reserve_reached"})
+        measured = count
+        try:
+            remaining = native.remaining()
+        except TimeoutError:
+            remaining = 0.0
+        decision = decide(evidence, mode=host.gate, policy=policy, remaining_seconds=remaining,
+                          worker_returns=returns, state=gate_state, evaluate_fidelity=evaluate_fidelity)
+        decisions.append({"after_worker_return": len(returns), "action": decision.action, "reason": decision.reason,
+                          "facts": decision.facts, **({"evidence_error": evidence_error} if evidence_error else {})})
+        save()
+        if decision.action == "continue":
+            instruction = CONTINUE_INSTRUCTION
+            continue
+        settle = decision.action == "finalize"
+        brief = []
+        if not briefed:
+            brief += [controller_prompt, "The Worker already received this task verbatim and has been working on it:",
+                      material]
+        brief += [("The Turn budget is nearly spent. Return the typed result now." if settle else
+                   "The Host consulted you because measured evidence may change the Worker's direction."),
+                  "Trigger: " + decision.reason,
+                  "Measured evidence:\n" + json.dumps(decision.facts, ensure_ascii=False, sort_keys=True),
+                  "Latest Worker report:\n" + json.dumps(report, ensure_ascii=False)]
+        if host.role_isolation == "caller":
+            brief.append("Inspect the workspace read-only. The Worker owns every file change.")
+        if not settle:
+            brief.append('Set instruction to a concrete redirection for the Worker, set instruction to "continue" '
+                         "when the current direction should proceed unchanged, or set result to settle the Turn.")
+        if not briefed:
+            brief.append("For your Core receipt:\n" + "\n".join(codex_receipt_instructions()))
+        briefed = True
+        reply = native.send("controller", "\n".join(brief), settle_schema if settle else consult_schema)
+        direction, result = reply.get("instruction"), reply.get("result")
+        if result is not None:
+            if direction is not None or not isinstance(result, dict):
+                raise ValueError("controller returned ambiguous decision")
+            return normalize_codex_result(request, result)
+        if settle or not isinstance(direction, str) or not direction.strip() or len(direction) > 16000:
+            raise ValueError("controller returned an invalid task")
+        decisions[-1]["controller_redirected"] = direction.strip().lower() != "continue"
+        instruction = direction if decisions[-1]["controller_redirected"] else CONTINUE_INSTRUCTION
 
 
 @contextmanager
@@ -418,16 +597,21 @@ def serve(request, host):
             return attempt["result"]
         # Test the selected executable and workspace sandbox before paid inference.
         # Turn supervision also enforces the outer deadline over this preflight.
-        probe = subprocess.run([host.codex_bin, "sandbox", "-P", ":workspace", "--",
-                                sys.executable, "-I", "-c", "pass"], cwd=project,
-                               capture_output=True, timeout=min(15, timeout))
-        if probe.returncode:
-            raise RuntimeError("Native Codex workspace sandbox is unavailable")
+        if host.role_isolation == "workspace":
+            probe = subprocess.run([host.codex_bin, "sandbox", "-P", ":workspace", "--",
+                                    sys.executable, "-I", "-c", "pass"], cwd=project,
+                                   capture_output=True, timeout=min(15, timeout))
+            if probe.returncode:
+                raise RuntimeError("Native Codex workspace sandbox is unavailable")
         def save():
             atomic_write_private_json(path, evidence)
         save()
         native = RoleTransport(host, deadline, admission, evidence, save)
-        if attempt is evidence:
+        if attempt is evidence and host.continuous:
+            if not material:
+                raise ValueError("original Worker task material is missing")
+            result = run_gated_roles(native, request, material, host=host, save=save, trail=evidence)
+        elif attempt is evidence:
             result = run_roles(native, request, material, dispatch_task_material=host.dispatch_task_material)
         else:
             result = correct_original_receipt(native, request, evidence)
@@ -448,11 +632,16 @@ def main():
     parser.add_argument("--material", type=Path)
     parser.add_argument("--material-sha256")
     parser.add_argument("--dispatch-task-material", action="store_true")
+    parser.add_argument("--controller-gate", choices=GATE_MODES, default="every-return")
+    parser.add_argument("--evidence-command-json")
+    parser.add_argument("--role-isolation", choices=ROLE_ISOLATIONS, default="workspace")
     args = parser.parse_args()
     home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
     host = RoleHost(args.project.resolve(), args.runtime.resolve(), args.registry.resolve(), home,
                     args.codex_bin, args.model, args.effort, args.sandbox, args.timeout, args.material, args.material_sha256,
-                    dispatch_task_material=args.dispatch_task_material)
+                    dispatch_task_material=args.dispatch_task_material, gate=args.controller_gate,
+                    evidence_command=parse_evidence_command(args.evidence_command_json),
+                    role_isolation=args.role_isolation)
     with interrupt_on_stop():
         print(json.dumps(serve(json.load(sys.stdin), host), ensure_ascii=False))
 

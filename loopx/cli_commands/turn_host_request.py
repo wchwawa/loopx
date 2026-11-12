@@ -44,6 +44,20 @@ def controller_worker_launch(args, registry: Path, runtime: Path) -> tuple[list[
         argv.extend(["--material", str(source), "--material-sha256", hashlib.sha256(data).hexdigest()])
         if task_material:
             argv.append("--dispatch-task-material")
+    # Gate, evidence source and Worker isolation are part of the admitted
+    # configuration: recovery under a different choice is held, like topology.
+    gate = getattr(args, "controller_gate", "every-return")
+    if gate != "every-return":
+        argv.extend(["--controller-gate", gate])
+    evidence_command = getattr(args, "evidence_command_json", None)
+    if evidence_command is not None:
+        from ..control_plane.turn_driver.controller_worker import parse_evidence_command
+
+        parse_evidence_command(evidence_command)
+        argv.extend(["--evidence-command-json", evidence_command])
+    isolation = getattr(args, "role_isolation", "workspace")
+    if isolation != "workspace":
+        argv.extend(["--role-isolation", isolation])
     # The deadline may shrink on recovery. Model, permissions, workspace and
     # private binding paths belong to the original admission.
     home = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())

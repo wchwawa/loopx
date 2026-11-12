@@ -84,6 +84,12 @@ def handle_turn_command(
             raise ValueError("controller-worker requires isolated-headless codex-cli with fresh role threads and no operation transport")
         if not dual and (getattr(args, "controller_material", None) or getattr(args, "task_material", None)):
             raise ValueError("role task material requires controller-worker topology")
+        gated = (getattr(args, "controller_gate", "every-return") != "every-return"
+                 or getattr(args, "role_isolation", "workspace") != "workspace")
+        if not dual and (gated or getattr(args, "evidence_command_json", None)):
+            raise ValueError("Controller gate, evidence and Worker isolation require controller-worker topology")
+        if gated and not getattr(args, "task_material", None):
+            raise ValueError("a gated Controller or caller-level Worker requires --task-material")
         if (native_host_runner is not None or native_session_binding_resolver is not None) and (
             args.host != "codex-app-server" or native_host_runner is None or native_session_binding_resolver is None
         ):
