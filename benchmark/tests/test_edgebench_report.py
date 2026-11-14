@@ -728,3 +728,43 @@ def test_heartbeat_turn_export_binds_role_topology(trial, observed):
     recorded = json.loads((output / "settings/run.json").read_text())["runner"]
     assert (recorded["requested_worker"], recorded["worker"]) == ("heartbeat-resume", "turn-controller-worker")
     assert recorded["turn_topology"] == observed and recorded["container_cpus"] == 2
+
+
+@pytest.mark.parametrize("receipt,profile", [
+    ("evidence", "evidence"), ("never", "never"), (None, None),
+    ("evidence", None), ("evidence", "never"), ("later", "later"),
+])
+def test_controller_worker_export_keeps_the_gate_that_separates_arms(trial, receipt, profile):
+    runs, selection, output, _ = trial
+    task = runs / "run" / "case"
+    for name, key, gate in (("runtime-receipt", "worker", receipt), ("worker-profile", "profile", profile)):
+        path = task / (name + ".json")
+        record = json.loads(path.read_text())
+        record[key] = "turn-controller-worker"
+        record.update(validation_argv_sha256="d" * 64, turn_topology="controller-worker")
+        if gate is not None:
+            record["controller_gate"] = gate
+        write(path, record)
+    if receipt != profile or receipt == "later":
+        with pytest.raises(ValueError, match="controller_gate"):
+            export(runs, selection, output, observed_at="2026-01-02T00:00:00+00:00")
+        return
+    export(runs, selection, output, observed_at="2026-01-02T00:00:00+00:00")
+    config = json.loads((output / "settings/run.json").read_text())
+    for field in ("runner", "worker_profile"):
+        # A run that reviewed every return keeps its historical shape: no key.
+        assert config[field].get("controller_gate") == receipt
+        assert ("controller_gate" in config[field]) is (receipt is not None)
+
+
+def test_export_rejects_a_gate_on_a_single_worker(trial):
+    runs, selection, output, _ = trial
+    task = runs / "run" / "case"
+    for name, key in (("runtime-receipt", "worker"), ("worker-profile", "profile")):
+        path = task / (name + ".json")
+        record = json.loads(path.read_text())
+        record[key] = "turn-resume"
+        record.update(validation_argv_sha256="e" * 64, controller_gate="evidence")
+        write(path, record)
+    with pytest.raises(ValueError, match="controller_gate"):
+        export(runs, selection, output, observed_at="2026-01-02T00:00:00+00:00")

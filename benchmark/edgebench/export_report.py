@@ -51,6 +51,16 @@ def _validate_worker_settings(runner, profile):
             raise ValueError("Turn validator argv digest missing or mismatched")
     elif key in runner or key in profile:
         raise ValueError("Unexpected Turn validator on another worker")
+    # The gate selects who reviews the Worker and when. Two arms that differ
+    # only here must stay distinguishable in the exported settings.
+    gate = runner.get("controller_gate")
+    if gate != profile.get("controller_gate"):
+        raise ValueError("Profile disagrees with runtime: controller_gate")
+    if gate is not None:
+        from benchmark.runtime.codex import CONTROLLER_GATES
+
+        if not dual or gate not in CONTROLLER_GATES:
+            raise ValueError("Unsupported controller_gate for this worker")
 
 
 def digest(path: Path) -> str:
@@ -359,7 +369,7 @@ def export(runs_root: Path, selection: list, output: Path, *, observed_at: str):
         }
         # Old notification-only attempts retain absent/unknown payload metadata;
         # never relabel them using today's default or operator-supplied settings.
-        for key in ("validation_argv_sha256", "turn_topology"):
+        for key in ("validation_argv_sha256", "turn_topology", "controller_gate"):
             if key in receipt:
                 for target in ("runner", "worker_profile"):
                     config[target][key] = receipt[key]
