@@ -129,16 +129,17 @@ secondary execution surface and result return to the original conversation.
 
 ### Keep one Worker working and gate Controller attention
 
-By default the Controller reviews every Worker return. For open-ended work
-whose progress is measured outside the conversation, a caller can keep one
-Worker advancing and spend Controller attention only where measurements change
-the choice:
+By default the Controller reviews every Worker return. For work that should
+keep advancing between reviews, a caller can keep one Worker working and spend
+Controller attention only when something new could change the choice. The
+Host decides whether the Controller should look. The Controller decides what
+to do.
 
 ```sh
 loopx turn run-once --execute --prepare-selected-todo --goal-id GOAL --agent-id AGENT \
   --project "$PWD" --host codex-cli --execution-mode isolated-headless \
   --topology controller-worker --task-material TASK.md --timeout-seconds 3600 \
-  --controller-gate evidence --evidence-command-json '["./read-results"]' \
+  --controller-gate evidence --evidence-command-json '["./read-evidence"]' \
   --codex-sandbox workspace-write --validation-command-json '["./check-work"]'
 ```
 
@@ -147,49 +148,77 @@ loopx turn run-once --execute --prepare-selected-todo --goal-id GOAL --agent-id 
 | Value | Controller turns |
 | --- | --- |
 | `every-return` (default) | Before the first dispatch and after each Worker return. |
-| `evidence` | When the gate fires, and once for the typed result. |
+| `evidence` | When the Host finds a signal, and once for the typed result. |
 | `never` | Once, for the typed result. |
 
 With `evidence` or `never` the Worker receives `--task-material` verbatim as
 its first input, with no Controller turn in front of it. After each Worker
-return the Host resumes the same Worker thread with a one-line continuation
-unless the gate asks for a consult. A deterministic rule set decides this
-without a model call. It consults the Controller when:
+return the Host checks for a signal without a model call. With no signal it
+resumes the same Worker thread with a one-line continuation.
 
-- the last three authoritative results added less than 5% of the gain achieved
-  since the first valid one (`authoritative_plateau`). Marginal new bests inside
-  one approach count as a stall, so a run that creeps upward is still caught;
-- every authoritative attempt so far failed (`no_valid_authoritative_result`);
-- a proxy measure ranks at least four paired candidates against the
-  authoritative one, using the shared scoped-fidelity operator
-  (`proxy_order_reversed`);
-- the Worker returned quickly twice with no new measurement (`worker_idle`).
+**What the Host treats as a signal.** The sources are typed. The Host never
+classifies Worker prose.
 
-Each trigger fires once per piece of new evidence, so a standing plateau does
-not interrupt the Worker again until more results arrive. A consult gives the
-Controller the original contract, the measured facts and the latest Worker
-report. It answers with a redirection for the Worker or `continue`. A consult
-cannot end the Turn early, and a failed or empty consult leaves the Worker on
-its own direction and session. Near the deadline the Host reserves time and
-asks the Controller for the typed result (`deadline_reserve`). A failed native
-Worker turn resumes the same thread with bounded backoff while budget remains.
-Use the default `every-return` gate for bounded work that should settle as soon
-as the Worker finishes.
+| Source | Signal | Fires when |
+| --- | --- | --- |
+| Worker report | `worker_blocked` | The Worker's typed `state` is `blocked`. |
+| Worker report | `assumption_refuted` | Its `state` is `assumption_refuted`: new evidence overturned the approach it was pursuing. |
+| Independent checks | `independent_check_failing` | The last two checks in the evidence snapshot failed. |
+| Measured results | `authoritative_plateau` | The last three authoritative results added under 5% of the gain since the first valid one. Marginal new bests count as a stall. |
+| Measured results | `no_valid_authoritative_result` | Three or more authoritative attempts and none is valid. |
+| Measured results | `proxy_order_reversed` | A proxy ranks at least four paired candidates against the authoritative measure (shared scoped-fidelity operator). |
+| Worker returns | `worker_idle` | Two quick returns in a row brought nothing new. |
+
+A scored task supplies measured results. A task without a score still has the
+first two sources and, with an evidence command, independent checks. A task
+with none of these lets the Worker continue. Each signal asks once per piece
+of new information: a standing condition does not interrupt the Worker again
+until something new arrives. A Worker statement is judged first, then
+independent checks, then measured trends.
+
+In a gated Turn the Worker's report carries one extra typed field, `state`,
+with the values `working`, `blocked` and `assumption_refuted`. Its task text is
+unchanged.
+
+**What the Controller decides.** A consult gives the Controller the original
+contract, the signal, its facts and the latest Worker report. It answers with
+one typed verdict:
+
+| Verdict | Effect |
+| --- | --- |
+| `continue` | The Worker resumes unchanged. |
+| `redirect` | The Controller's instruction reaches the Worker verbatim. |
+| `needs_help` | The Controller returns a `user_action_required` result that states what the owner must decide or provide, and the Turn settles. |
+
+Only `needs_help` ends the work before the deadline. A consult cannot settle
+the Turn as progress or completion. A failed consult, or a verdict without its
+instruction, leaves the Worker on its own direction and session. Pass
+`--unattended` when no owner can answer during the Turn: the verdict is then
+limited to `continue` and `redirect`. Near the deadline the Host reserves time
+and asks the Controller for the typed result (`deadline_reserve`). A failed
+native Worker turn resumes the same thread with bounded backoff while budget
+remains. Use the default `every-return` gate for bounded work that should
+settle as soon as the Worker finishes.
 
 `--evidence-command-json` names a trusted argv that the Host runs after each
-Worker return. It prints one `turn_worker_evidence_v0` object:
+Worker return. It prints one `turn_worker_evidence_v0` object. `checks` and
+`measurements` are both optional, and `higher_is_better` is required with
+measurements:
 
 ```json
-{"schema_version": "turn_worker_evidence_v0", "higher_is_better": true,
+{"schema_version": "turn_worker_evidence_v0",
+ "checks": [{"check_ref": "integration", "passed": false, "sequence": 0}],
+ "higher_is_better": true,
  "measurements": [{"candidate_ref": "s1", "value": 41.5, "valid": true,
                    "authoritative": true, "sequence": 0}]}
 ```
 
 A missing, failing or malformed snapshot never stops the work: the gate then
-has no measurement triggers and records `evidence_error`. Every gate decision,
-with its reason and facts, is appended to `gate_decisions` in the private
-`turns/controller-worker/` record beside the per-role usage, so Controller cost
-and each intervention can be audited separately from Worker cost.
+has only the Worker's own signals and records `evidence_error`. Every gate
+decision is appended to `gate_decisions` in the private
+`turns/controller-worker/` record with its reason, its facts and the
+Controller's outcome, beside the per-role usage. Controller cost and each
+intervention can be audited separately from Worker cost.
 
 `--role-isolation caller` runs both roles under the caller's own
 `--codex-sandbox` grant and environment, with no nested workspace sandbox. Use
@@ -197,8 +226,9 @@ it only inside a disposable boundary, such as a benchmark task container, whose
 evaluator tools live outside the workspace or whose kernel cannot nest a
 sandbox. The Controller is then read-only by instruction, and
 `--controller-material` is unavailable because the Worker could read it. Gate,
-evidence command and isolation are part of the admitted Host configuration:
-recovery under a different choice is held, like a changed topology.
+evidence command, isolation and `--unattended` are part of the admitted Host
+configuration: recovery under a different choice is held, like a changed
+topology.
 
 ## Generic Agent CLI Quick Start
 

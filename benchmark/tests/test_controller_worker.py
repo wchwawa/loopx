@@ -71,6 +71,9 @@ def test_benchmark_turn_command_selects_the_gate_once():
     check = ("check-work",)
     legacy = turn_command(env, Execution(mode="turn", controller_worker=True, validation_command=check), "wake-1")
     assert "--controller-gate" not in legacy and "--role-isolation" not in legacy
+    assert "--unattended" not in legacy and "--unattended" in turn_command(
+        env, Execution(mode="turn", controller_worker=True, controller_gate="never", validation_command=check),
+        "wake-1")
     gated = turn_command(env, Execution(mode="turn", controller_worker=True, controller_gate="evidence",
                                         validation_command=check), "wake-1")
     at = gated.index("--controller-gate")

@@ -218,9 +218,13 @@ then receives the pinned task file first with no Controller turn before it,
 runs under the trial's own grant so it can call `sforge-submit`, and is resumed
 on the same session after each return. Between returns the Host reads the
 solver-visible submission history (`benchmark/runtime/native_evidence.py`, no
-model call and no evaluation slot). `evidence` consults the Controller only
-when the last three completed native results add under 5% of the gain so far,
-every native attempt has failed, or the Worker returns idle;
+model call and no evaluation slot). Native scores are the evidence this
+benchmark supplies to the generic Host gate. `evidence` consults the Controller
+only when the last three completed native results add under 5% of the gain so
+far, every native attempt has failed, the Worker reports itself blocked or its
+assumption refuted, or it returns idle. A trial has no owner to answer, so the
+runner passes `--unattended` and the Controller can continue or redirect the
+Worker but cannot end the trial to ask for help;
 `never` consults it once for the Turn receipt and isolates the effect of the
 continuous Worker. These modes need no nested sandbox in the guest. Both roles
 then share the task container's boundary, and the Controller is read-only by

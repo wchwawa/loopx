@@ -328,10 +328,11 @@ def turn_command(
         if execution.controller_gate != "every-return":
             # One Worker keeps working with the trial's own grant, as the
             # official solver does, so it can reach the native evaluator. The
-            # Host reads the same solver-visible history between returns.
+            # Host reads the same solver-visible history between returns. A
+            # trial has no owner to answer, so the Controller cannot ask for help.
             evidence = [sys.executable, str(Path(__file__).with_name("native_evidence.py"))]
             host.extend(["--controller-gate", execution.controller_gate, "--role-isolation", "caller",
-                         "--evidence-command-json", json.dumps(evidence)])
+                         "--evidence-command-json", json.dumps(evidence), "--unattended"])
     return loopx_command(env) + [
         "turn",
         "run-once",

@@ -1169,26 +1169,31 @@ The first two-role provider consulted the Controller before the first dispatch
 and after every Worker return, and confined the Worker so tightly that it could
 not reach an external evaluator. Its own open-search diagnostic scored lower
 than one Worker, with no Controller feedback on any intermediate candidate.
-The provider now offers `--controller-gate evidence|never` for open-ended work
-measured outside the conversation:
+The provider now offers `--controller-gate evidence|never` for work that
+should keep advancing between reviews:
 
 - **Worker.** One native session receives the caller's task first, verbatim,
   and is resumed after each return with a one-line continuation. It carries no
-  Core contract. A failed native turn resumes the same session with bounded
-  backoff.
-- **Gate.** After each return the Host reads a caller-supplied
-  `turn_worker_evidence_v0` snapshot and decides without a model call. Ordinary
-  returns cost no Controller tokens. A consult fires on an authoritative
-  plateau (recent results adding under 5% of the gain so far, so marginal new
-  bests still count), a run of failed authoritative results with no incumbent,
-  a proxy that ranks against the authoritative measure (through the
-  shared scoped-fidelity operator), or an idle Worker, once per piece of new
-  evidence.
-- **Controller.** On a consult it receives the contract, the measured facts and
-  the latest report, and answers with a redirection or `continue`. A consult
-  cannot end the Turn early, and its failure leaves the Worker on its own
-  direction and session. The Controller authors the Core receipt at the
-  deadline reserve. `never` keeps only that last turn, which separates the
+  Core contract. Its report adds one typed `state`: working, blocked, or
+  assumption refuted. A failed native turn resumes the same session with
+  bounded backoff.
+- **Host: is this worth a Controller look?** After each return the Host
+  decides without a model call, from typed signals only. The Worker's own
+  state is one source. Independent checks that keep failing are another. For
+  scored tasks, measured results are a third: a plateau (recent results adding
+  under 5% of the gain so far, so marginal new bests still count), a run of
+  failed results with no incumbent, or a proxy that ranks against the
+  authoritative measure through the shared scoped-fidelity operator. A score
+  is one kind of evidence an adapter may supply, not a requirement. With no
+  signal the Worker continues and the boundary costs no Controller tokens.
+  Each signal asks once per piece of new information.
+- **Controller: what to do.** On a consult it receives the contract, the
+  signal, its facts and the latest report, and returns one typed verdict:
+  `continue`, `redirect` with an instruction, or `needs_help`, which settles
+  the Turn as `user_action_required`. Only `needs_help` ends the work early,
+  and an unattended caller removes it. A failed consult leaves the Worker on
+  its own direction and session. The Controller authors the Core receipt at
+  the deadline reserve. `never` keeps only that last turn, which separates the
   effect of a continuous Worker from the effect of Controller judgment.
 
 Every decision is recorded with its reason and facts beside per-role usage.
