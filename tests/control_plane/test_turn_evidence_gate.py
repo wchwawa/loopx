@@ -190,6 +190,22 @@ def test_independent_check_failing_repeatedly_asks_for_attention():
     assert gate.evidence_size(snapshot([1.0, 2.0], checks=[True])) == 3 and gate.evidence_size(None) == 0
 
 
+def test_self_judged_worker_is_told_only_what_it_did_not_say_or_do_itself():
+    plateau = snapshot([5.0, 1.0, 1.0, 1.0])
+    # Independent results and checks ask exactly as they would for a Controller.
+    assert decide(plateau, {}, mode="evidence-self").reason == "authoritative_plateau"
+    failing = decide(checked(False, False), {}, mode="evidence-self", returns=[returned()])
+    assert (failing.action, failing.reason) == ("consult", "independent_check_failing")
+    # Its own statement and its own pace are not news to the Worker.
+    assert decide(None, {}, mode="evidence-self", returns=[returned("blocked")]).action == "continue"
+    quick = {"elapsed_seconds": 20.0, "new_evidence": 0}
+    assert decide(None, {}, mode="evidence-self", returns=[quick, quick]).action == "continue"
+    # A statement does not hide an independent stall seen at the same boundary.
+    both = decide(plateau, {}, mode="evidence-self", returns=[returned("blocked")])
+    assert both.reason == "authoritative_plateau" and both.facts["worker_state"] == "blocked"
+    assert decide(plateau, {}, mode="evidence-self", remaining=200).reason == "no_consult_window"
+
+
 @pytest.mark.parametrize("payload", [
     {"schema_version": "other", "higher_is_better": True, "measurements": []},
     {"schema_version": gate.EVIDENCE_SCHEMA, "higher_is_better": "yes", "measurements": []},

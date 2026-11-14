@@ -121,10 +121,11 @@ def main(argv=None):
     parser.add_argument("--worker", choices=PROFILES, required=True)
     parser.add_argument("--turn-topology", choices=("single-worker", "controller-worker"),
                         help="Execute the quota-admitted heartbeat or Turn through the shared governed Turn host")
-    parser.add_argument("--controller-gate", choices=("every-return", "evidence", "never"),
+    parser.add_argument("--controller-gate", choices=("every-return", "evidence", "evidence-self", "never"),
                         help="For the Controller-Worker topology: review every Worker return (default), keep one "
                              "Worker working and consult the Controller only when native results change the "
-                             "choice, or consult it only for the final result")
+                             "choice, give those results to the Worker to judge itself, or consult the "
+                             "Controller only for the final result")
     parser.add_argument("--validation-command-json", type=json.loads,
                         help="For governed Turn workers, trusted guest argv that independently checks the work postcondition")
     parser.add_argument("--feedback", choices=FEEDBACK_MODES, default="native",

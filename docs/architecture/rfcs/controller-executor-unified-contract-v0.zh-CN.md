@@ -934,7 +934,7 @@ judge 评分。分别记录最后验证的分数、黑盒调用次数、完整 t
 **按证据介入的检查点（仅源码与受控后端验证）。** 首个双角色 provider 在首次派发前和每次
 Worker 返回后都调用 Controller，并把 Worker 限制到无法访问外部评测器。它自己的开放搜索
 诊断得分低于单 Worker，期间没有任何中间候选得到 Controller 反馈。provider 现在为
-需要在两次评审之间持续推进的工作提供 `--controller-gate evidence|never`：
+需要在两次评审之间持续推进的工作提供 `--controller-gate evidence|evidence-self|never`：
 
 - **Worker。** 一个原生会话首先原样收到调用方的任务，每次返回后用一行续跑指令恢复，
   不携带 Core 契约。它的报告多带一个类型化的 `state`：工作中、被阻塞、或假设被推翻。
@@ -951,11 +951,16 @@ Worker 返回后都调用 Controller，并把 Worker 限制到无法访问外部
   咨询失败时 Worker 保持原方向和原会话。到达截止预留时由 Controller 产出 Core 回执。
   `never` 只保留这最后一轮，用来把"Worker 连续工作"的效果与"Controller 判断"的效果
   分开。
+- **门决定何时判断，不决定由谁判断。** `evidence-self` 使用同一道门，把触发原因和事实
+  交给 Worker 自己的会话，并提出与 Controller 相同的问题。产出回执之前不占用第二个
+  会话。只转交独立校验和测量结果：Worker 自己声明的状态和节奏对它不是新信息。这是方法
+  反馈的单会话形式，与 `evidence`、`never` 共用同一个 Worker 循环，三者对照可以把
+  "及时给出事实"的效果与"第二个判断者"的效果分开。
 
 每次判断连同原因和事实记录在各角色用量旁。默认的 `every-return` 行为、已准入配置的身份
 和恢复方式不变。本检查点用真实 Codex CLI、受控推理后端和 SQLite 权威存储运行，不证明
 原生分或成本收益：第 2 步的同条件对照仍是修改任何默认值的前提，对照需包含 `official`、
-单 Worker 和三种门取值，并冻结预算。基准 guest 所需的 `--role-isolation caller` 去掉了
+单 Worker 和四种门取值，并冻结预算。基准 guest 所需的 `--role-isolation caller` 去掉了
 嵌套隔离，只适合可丢弃的边界之内。详见
 [Turn 契约](../../reference/protocols/loopx-turn-v0.md#keep-one-worker-working-and-gate-controller-attention)。
 

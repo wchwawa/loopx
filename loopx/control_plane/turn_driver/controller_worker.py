@@ -29,7 +29,8 @@ from loopx.control_plane.turn_driver.codex_cli import (
 from loopx.control_plane.turn_driver.host_process_transport import HostOutputLines, run_host_process
 from loopx.control_plane.turn_driver.decision_capture import read_turn_observation_text
 from loopx.control_plane.turn_driver.evidence_gate import (
-    CONTROLLER_VERDICTS, GATE_MODES, WORKER_STATES, GatePolicy, decide, evidence_size, normalize_evidence,
+    CONTROLLER_VERDICTS, GATE_MODES, SELF_JUDGED_MODE, WORKER_STATES, GatePolicy, decide, evidence_size,
+    normalize_evidence,
 )
 from loopx.control_plane.turn_driver.executor import MATERIAL_HOST_RESULT_KINDS
 from loopx.control_plane.turn_driver.host_candidate import extract_turn_work_identity
@@ -57,6 +58,12 @@ GATED_WORK_REPORT = object_schema({**WORK_REPORT["properties"], "state": {
 }})
 ROLE_ISOLATIONS = ("workspace", "caller")
 CONTINUE_INSTRUCTION = "Continue working toward the task objective."
+# The self-judged Worker gets the question a Controller would get, with the same criteria.
+SELF_REVIEW_INSTRUCTION = (
+    "While you worked, the Host read the independent results of your work and found something that may change "
+    "what you should do next. Judge from these facts whether your current direction should proceed unchanged, "
+    "or whether it has stalled or been refuted and a different approach clearly has more room. Act on that "
+    "judgment and keep working toward the task objective.")
 _EVIDENCE_TIMEOUT_SECONDS = 30
 _WORKER_RETRY_BACKOFF_SECONDS = (5, 20, 60, 120, 300)
 
@@ -420,8 +427,10 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
     call, whether anything new is worth a Controller look: the Worker's typed
     state, failing independent checks, or measured results where the task has
     them. Otherwise the same Worker thread resumes immediately. When asked, the
-    Controller answers continue, redirect or needs_help. The deadline reserve
-    asks it for the typed Core result.
+    Controller answers continue, redirect or needs_help. In the self-judged
+    mode the Worker receives those facts instead and judges its own direction,
+    so no second session is spent before the result. The deadline reserve asks
+    the Controller for the typed Core result.
     """
     controller_prompt, result_schema = prepare_codex_controller_input(request)
     verdicts = [verdict for verdict in CONTROLLER_VERDICTS if verdict != "needs_help" or not host.unattended]
@@ -476,6 +485,12 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
             instruction = CONTINUE_INSTRUCTION
             continue
         settle = decision.action == "finalize"
+        if not settle and host.gate == SELF_JUDGED_MODE:
+            decisions[-1]["worker_informed"] = True
+            save()
+            instruction = "\n".join([SELF_REVIEW_INSTRUCTION, "Trigger: " + decision.reason,
+                                     "Facts:\n" + json.dumps(decision.facts, ensure_ascii=False, sort_keys=True)])
+            continue
         brief = []
         if not briefed:
             brief += [controller_prompt, "The Worker already received this task verbatim and has been working on it:",

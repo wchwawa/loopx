@@ -143,18 +143,19 @@ loopx turn run-once --execute --prepare-selected-todo --goal-id GOAL --agent-id 
   --codex-sandbox workspace-write --validation-command-json '["./check-work"]'
 ```
 
-`--controller-gate` takes three values:
+`--controller-gate` takes four values:
 
-| Value | Controller turns |
-| --- | --- |
-| `every-return` (default) | Before the first dispatch and after each Worker return. |
-| `evidence` | When the Host finds a signal, and once for the typed result. |
-| `never` | Once, for the typed result. |
+| Value | Controller turns | Who judges a signal |
+| --- | --- | --- |
+| `every-return` (default) | Before the first dispatch and after each Worker return. | Controller |
+| `evidence` | When the Host finds a signal, and once for the typed result. | Controller |
+| `evidence-self` | Once, for the typed result. | The Worker itself |
+| `never` | Once, for the typed result. | Nobody |
 
-With `evidence` or `never` the Worker receives `--task-material` verbatim as
-its first input, with no Controller turn in front of it. After each Worker
-return the Host checks for a signal without a model call. With no signal it
-resumes the same Worker thread with a one-line continuation.
+With any value but `every-return` the Worker receives `--task-material`
+verbatim as its first input, with no Controller turn in front of it. After each
+Worker return the Host checks for a signal without a model call. With no signal
+it resumes the same Worker thread with a one-line continuation.
 
 **What the Host treats as a signal.** The sources are typed. The Host never
 classifies Worker prose.
@@ -199,6 +200,18 @@ and asks the Controller for the typed result (`deadline_reserve`). A failed
 native Worker turn resumes the same thread with bounded backoff while budget
 remains. Use the default `every-return` gate for bounded work that should
 settle as soon as the Worker finishes.
+
+**When the Worker judges itself.** `evidence-self` uses the same gate but
+spends no second session. On a signal the Host resumes the Worker thread with
+the trigger, the same facts and the same question a Controller would get:
+should the current direction proceed, or has it stalled or been refuted while
+another approach has more room? Only signals from independent checks and
+measured results are passed on. The Worker's own `state` and its own pace are
+not news to it, so `worker_blocked`, `assumption_refuted` and `worker_idle` do
+not fire in this mode. The decision row records `worker_informed` and has no
+Controller outcome. `evidence`, `evidence-self` and `never` share one Worker
+loop and one gate, so a matched comparison of the three separates the effect of
+timely facts from the effect of a second session.
 
 `--evidence-command-json` names a trusted argv that the Host runs after each
 Worker return. It prints one `turn_worker_evidence_v0` object. `checks` and

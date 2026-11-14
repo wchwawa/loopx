@@ -125,6 +125,33 @@ def test_never_mode_spends_one_controller_turn_for_the_receipt(tmp_path):
     assert native.worker_prompts == [TASK] + [roles.CONTINUE_INSTRUCTION] * (len(native.worker_prompts) - 1)
 
 
+def test_self_judged_worker_gets_the_same_facts_with_no_controller_turn_before_the_receipt(tmp_path):
+    scores = [1.0, 2.0, 3.0, 3.0, 2.5, 2.9, 4.0, 5.0]
+    snapshots = [(evidence_of(scores[:n]), None) for n in range(1, len(scores) + 1)]
+    native = Transport(budget=10_000, turn_seconds=1_000, controller=[RECEIPT])
+    result, trail = run(native, tmp_path, mode="evidence-self", snapshots=snapshots)
+
+    assert result == RECEIPT
+    # The same boundary and facts as a Controller consult, delivered into the Worker's own thread.
+    assert native.worker_prompts[:6] == [TASK] + [roles.CONTINUE_INSTRUCTION] * 5
+    informed = native.worker_prompts[6]
+    assert informed.startswith(roles.SELF_REVIEW_INSTRUCTION) and "Trigger: authoritative_plateau" in informed
+    assert '"results_since_best": 3' in informed
+    assert native.worker_prompts[7:] == [roles.CONTINUE_INSTRUCTION] * 3
+    # The only Controller turn is the typed result at the deadline reserve.
+    assert len(native.controller_prompts) == 1 and native.controller_prompts[0].startswith("C1 CONTRACT")
+    assert "Trigger: deadline_reserve" in native.controller_prompts[0]
+    told = trail["gate_decisions"][5]
+    assert (told["action"], told["reason"], told["worker_informed"]) == ("consult", "authoritative_plateau", True)
+    assert "controller_outcome" not in told
+    # A Worker that says it is blocked has no second party to hear it in this mode.
+    stuck = Transport(budget=4_000, turn_seconds=1_000, states=["working", "blocked", "blocked"],
+                      controller=[RECEIPT])
+    _, quiet = run(stuck, tmp_path, mode="evidence-self", snapshots=[], timeout=4_000.0)
+    assert {d["action"] for d in quiet["gate_decisions"][:-1]} == {"continue"}
+    assert set(stuck.worker_prompts[1:]) == {roles.CONTINUE_INSTRUCTION} and len(stuck.controller_prompts) == 1
+
+
 def test_controller_may_let_the_worker_proceed_unchanged(tmp_path):
     flat = [(evidence_of([5.0, 1.0, 1.0][:n] + [1.0] * max(0, n - 3)), None) for n in range(1, 9)]
     native = Transport(budget=10_000, turn_seconds=1_500, controller=[
@@ -270,8 +297,10 @@ def test_evidence_command_is_trusted_argv_and_fails_soft(tmp_path):
 
 @pytest.mark.skipif(os.environ.get("LOOPX_TEST_NATIVE_ROLE_HOST") != "1",
                     reason="opt-in installed Codex CLI against a local inference fixture")
-@pytest.mark.parametrize("entry", ["turn", "benchmark"])
+@pytest.mark.parametrize("entry", ["turn", "benchmark", "self"])
 def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entry):
+    # "self" runs the same Turn with the Worker as its own judge.
+    mode = "evidence-self" if entry == "self" else "evidence"
     from tests.control_plane.canonical_authority_fixture import initialize_canonical_source_fixture
     from tests.control_plane.codex_checkpoint_fixture import local_inference_provider
 
@@ -309,7 +338,8 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entr
         else:
             text = [part["text"] for item in request["input"] if item.get("role") == "user"
                     for part in item["content"] if "text" in part][-1]
-            if "Trigger: " in text:
+            told = text.startswith(roles.SELF_REVIEW_INSTRUCTION)
+            if "Trigger: " in text and not told:
                 controller_inputs.append(text)
                 if "Turn request:\n" in text:
                     key = json.JSONDecoder().raw_decode(text.split("Turn request:\n", 1)[1])[0]["turn_key"]
@@ -329,7 +359,7 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entr
             else:
                 worker_inputs.append(text)
                 command = ("tr -d '\\n' > " + marker + " <<EOF\n$(cat observation)\nEOF"
-                           if text.startswith("Copy the checked") else "cat observation; sleep 2")
+                           if text.startswith("Copy the checked") or told else "cat observation; sleep 2")
                 return {"type": "function_call", "id": f"fc_{index}", "call_id": f"call_{index}",
                         "name": "exec_command", "arguments": json.dumps({"cmd": command})}
         message["content"][0]["text"] = json.dumps(answer)
@@ -407,10 +437,10 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entr
                "--scheduler-owner", "outer_controller", "--prepare-selected-todo",
                "--turn-instance-id", "gated-roles", "--timeout-seconds", "60", "--codex-bin", str(wrapper),
                "--task-material", str(task), "--codex-sandbox", "workspace-write",
-               "--controller-gate", "evidence", "--role-isolation", "caller",
+               "--controller-gate", mode, "--role-isolation", "caller",
                "--evidence-command-json", json.dumps([sys.executable, str(evidence)]),
                "--validation-command-json", json.dumps(fixture["_validator_command"](expected))]
-        if entry == "turn":
+        if entry != "benchmark":
             feedback.shutdown()
             completed = subprocess.run(cmd, cwd=project, env=env, timeout=150, capture_output=True, text=True)
             assert completed.returncode == 0, completed.stdout[-2200:] + completed.stderr[-500:]
@@ -425,28 +455,43 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entr
 
     # The Worker received the caller's task first, verbatim, with no Controller turn before it.
     assert worker_inputs[0] == TASK
-    assert worker_inputs[1] == "Copy the checked observation into the output file."
-    assert set(worker_inputs[2:]) <= {roles.CONTINUE_INSTRUCTION,
-                                      "Copy the checked observation into the output file."}
-    assert "Trigger: authoritative_plateau" in controller_inputs[0] and "Turn request:" in controller_inputs[0]
-    assert "For your Core receipt:" not in controller_inputs[0]
-    assert all("Turn request:" not in text for text in controller_inputs[1:])
+    if entry == "self":
+        # The plateau facts reached the Worker's own thread, and the Controller only wrote the receipt.
+        assert worker_inputs[1].startswith(roles.SELF_REVIEW_INSTRUCTION)
+        assert "Trigger: authoritative_plateau" in worker_inputs[1]
+        assert all(text == roles.CONTINUE_INSTRUCTION or text.startswith(roles.SELF_REVIEW_INSTRUCTION)
+                   for text in worker_inputs[1:])
+        assert len(controller_inputs) == 1 and "Turn request:" in controller_inputs[0]
+    else:
+        assert worker_inputs[1] == "Copy the checked observation into the output file."
+        assert set(worker_inputs[2:]) <= {roles.CONTINUE_INSTRUCTION,
+                                          "Copy the checked observation into the output file."}
+        assert "Trigger: authoritative_plateau" in controller_inputs[0] and "Turn request:" in controller_inputs[0]
+        assert "For your Core receipt:" not in controller_inputs[0]
+        assert all("Turn request:" not in text for text in controller_inputs[1:])
     assert "Trigger: deadline_reserve" in controller_inputs[-1] and "For your Core receipt:" in controller_inputs[-1]
     assert (project / marker).read_text() == expected
     record, = (runtime / "goals" / goal / "turns/controller-worker").glob("*.json")
     journal = json.loads(record.read_text())
     roles_seen = [step["role"] for step in journal["steps"]]
-    assert roles_seen[:3] == ["worker", "controller", "worker"] and roles_seen[-1] == "controller"
     decisions = journal["gate_decisions"]
     assert (decisions[0]["action"], decisions[0]["reason"]) == ("consult", "authoritative_plateau")
-    assert decisions[0]["controller_outcome"] == "redirected"
     assert (decisions[-1]["action"], decisions[-1]["reason"]) == ("finalize", "deadline_reserve")
     assert all(d["action"] != "finalize" for d in decisions[:-1])
     assert len(set(journal["threads"].values())) == 2
     lines = invocations.read_text().splitlines()
     execs = [line for line in lines if line.startswith("exec")]
-    # Two fresh native sessions, then only resumes of those two exact sessions.
-    assert execs[:2] == ["exec", "exec"]
-    assert set(execs[2:]) == {"exec resume " + journal["threads"][role] for role in ("worker", "controller")}
+    if entry == "self":
+        assert set(roles_seen[:-1]) == {"worker"} and roles_seen[-1] == "controller"
+        assert decisions[0]["worker_informed"] is True and "controller_outcome" not in decisions[0]
+        # One Worker session resumed throughout; the Controller's only session starts at the receipt.
+        assert execs[0] == execs[-1] == "exec"
+        assert set(execs[1:-1]) == {"exec resume " + journal["threads"]["worker"]}
+    else:
+        assert roles_seen[:3] == ["worker", "controller", "worker"] and roles_seen[-1] == "controller"
+        assert decisions[0]["controller_outcome"] == "redirected"
+        # Two fresh native sessions, then only resumes of those two exact sessions.
+        assert execs[:2] == ["exec", "exec"]
+        assert set(execs[2:]) == {"exec resume " + journal["threads"][role] for role in ("worker", "controller")}
     assert "sandbox" not in lines
     assert fixture["_quota_spend_count"](runtime) == 1

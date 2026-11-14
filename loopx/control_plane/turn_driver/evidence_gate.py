@@ -15,6 +15,11 @@ interprets Worker prose:
 
 A task with none of these simply lets the Worker continue. The gate owns no
 Goal, Todo, quota or settlement state.
+
+The gate decides when a judgment is due, not who makes it. `evidence` asks
+the Controller. `evidence-self` hands the same facts to the Worker, which
+then judges its own direction without a second session; only facts the
+Worker did not produce itself count as news there.
 """
 from __future__ import annotations
 
@@ -23,7 +28,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-GATE_MODES = ("every-return", "evidence", "never")
+GATE_MODES = ("every-return", "evidence", "evidence-self", "never")
+# In this mode the Worker is its own judge, so its own report and pace are not news.
+SELF_JUDGED_MODE = "evidence-self"
 # The Worker states its own situation as a typed value in each report.
 WORKER_STATES = ("working", "blocked", "assumption_refuted")
 # The Controller's answer to a consult. `needs_help` ends the Turn for an owner.
@@ -296,11 +303,13 @@ def decide(
         return GateDecision("continue", "no_consult_window" if mode != "never" else "gate_disabled", facts)
 
     # Explicit statements first, then independent checks, then measured trends.
-    reason = _reported_signal(worker_returns, policy, state)
+    # A Worker judging itself is only told what it did not already say or do.
+    independent_only = mode == SELF_JUDGED_MODE
+    reason = None if independent_only else _reported_signal(worker_returns, policy, state)
     if reason is None and evidence is not None:
         reason = (_check_signal(evidence, policy, state, facts)
                   or _measured_signal(evidence, policy, state, facts, evaluate_fidelity))
-    if reason is None:
+    if reason is None and not independent_only:
         reason = _idle_signal(worker_returns, policy, state)
     if reason is None:
         return GateDecision("continue", "no_decision_relevant_evidence", facts)

@@ -19,8 +19,9 @@ CONTEXTS = ("fresh", "resume")
 TASK_ENTRIES = ("seeded-todo", "loopx-planned")
 SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 # every-return: the Controller reviews each Worker return. evidence: only when
-# measured results change the choice. never: only for the final typed result.
-CONTROLLER_GATES = ("every-return", "evidence", "never")
+# measured results change the choice. evidence-self: the Worker gets those
+# results and judges itself. never: only for the final typed result.
+CONTROLLER_GATES = ("every-return", "evidence", "evidence-self", "never")
 
 
 @dataclass(frozen=True)

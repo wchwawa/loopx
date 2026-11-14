@@ -211,7 +211,7 @@ The sandbox enforces the two roles' file and tool grants at execution. In this
 default form the Worker has no network and cannot run `sforge-submit`, so it
 receives no native score during the phase.
 
-Add `--controller-gate evidence` or `--controller-gate never` to keep one
+Add `--controller-gate evidence`, `evidence-self` or `never` to keep one
 Worker working for the whole phase, as the official solver does. These modes
 default to `--task-entry seeded-todo`, so no planning wake runs first. The Worker
 then receives the pinned task file first with no Controller turn before it,
@@ -225,13 +225,20 @@ far, every native attempt has failed, the Worker reports itself blocked or its
 assumption refuted, or it returns idle. A trial has no owner to answer, so the
 runner passes `--unattended` and the Controller can continue or redirect the
 Worker but cannot end the trial to ask for help;
+`evidence-self` uses the same gate on native results but resumes the Worker
+with those facts instead of consulting the Controller, so the Worker judges its
+own direction and no second session runs before the receipt.
 `never` consults it once for the Turn receipt and isolates the effect of the
 continuous Worker. These modes need no nested sandbox in the guest. Both roles
 then share the task container's boundary, and the Controller is read-only by
 instruction. `gate_decisions` in the role record lists every decision with its
-reason, so each Controller intervention can be matched to the native results
-that followed it. Compare all three gate values and `official` under the same
-task, model, effort, cooldown and phase budget. The gate reads native results
+reason, so each intervention can be matched to the native results that
+followed it. The runtime receipt, worker profile and exported report settings
+all carry a non-default gate, and the default stays absent as in earlier
+receipts. Compare the gate values and `official` under the same
+task, model, effort, cooldown and phase budget: `never`, `evidence-self` and
+`evidence` share one Worker loop, so they separate a continuous Worker, timely
+facts and a second judge. The gate reads native results
 only; it holds no opinion on a local proxy unless the evidence source supplies
 proxy measurements.
 

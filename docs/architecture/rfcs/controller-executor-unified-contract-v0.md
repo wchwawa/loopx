@@ -1169,8 +1169,8 @@ The first two-role provider consulted the Controller before the first dispatch
 and after every Worker return, and confined the Worker so tightly that it could
 not reach an external evaluator. Its own open-search diagnostic scored lower
 than one Worker, with no Controller feedback on any intermediate candidate.
-The provider now offers `--controller-gate evidence|never` for work that
-should keep advancing between reviews:
+The provider now offers `--controller-gate evidence|evidence-self|never` for
+work that should keep advancing between reviews:
 
 - **Worker.** One native session receives the caller's task first, verbatim,
   and is resumed after each return with a one-line continuation. It carries no
@@ -1195,13 +1195,21 @@ should keep advancing between reviews:
   its own direction and session. The Controller authors the Core receipt at
   the deadline reserve. `never` keeps only that last turn, which separates the
   effect of a continuous Worker from the effect of Controller judgment.
+- **The gate decides when, not who.** `evidence-self` runs the same gate and
+  hands the trigger and facts to the Worker's own session with the question a
+  Controller would get. No second session is spent before the receipt. Only
+  independent checks and measured results are passed on: the Worker's own
+  state and pace are not news to it. This is the single-session form of
+  method feedback, and it shares the Worker loop with `evidence` and `never`,
+  so the three separate the effect of timely facts from the effect of a
+  second judge.
 
 Every decision is recorded with its reason and facts beside per-role usage.
 The default `every-return` behaviour, the admitted configuration identity and
 recovery are unchanged. This checkpoint runs the real Codex CLI against a
 controlled inference backend with a SQLite authority store. It does not
 establish a native-score or cost benefit: the matched comparison in step 2,
-with `official`, single-worker and all three gate values under frozen budgets,
+with `official`, single-worker and all four gate values under frozen budgets,
 is still required before any default changes. `--role-isolation caller`, which
 the benchmark guest needs, removes nested confinement and is suitable only
 inside a disposable boundary. See the [Turn contract](../../reference/protocols/loopx-turn-v0.md#keep-one-worker-working-and-gate-controller-attention).

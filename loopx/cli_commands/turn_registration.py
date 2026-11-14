@@ -179,10 +179,12 @@ def register_turn_commands(
     material.add_argument("--task-material", type=Path, help="Original task for the Worker, forwarded verbatim after Controller dispatch.")
     material.add_argument("--controller-material", type=Path,
                           help="An additional UTF-8 task file for the Controller (up to 128 KiB, pinned at admission).")
-    run_once.add_argument("--controller-gate", choices=("every-return", "evidence", "never"), default="every-return",
-        help="When the Controller reviews Worker returns: after each one, only when measured evidence "
-             "changes the choice, or only for the final typed result. The last two keep one Worker "
-             "working on --task-material until the deadline reserve.")
+    run_once.add_argument("--controller-gate", choices=("every-return", "evidence", "evidence-self", "never"),
+        default="every-return",
+        help="When the Controller reviews Worker returns: after each one, only when new evidence may "
+             "change the choice, or only for the final typed result. evidence-self gives that evidence "
+             "to the Worker to judge itself, with no Controller session before the result. All but "
+             "every-return keep one Worker working on --task-material until the deadline reserve.")
     run_once.add_argument("--evidence-command-json",
         help="Trusted JSON argv run by the Host after each Worker return; prints a turn_worker_evidence_v0 "
              "snapshot of independent checks and, for scored tasks, measured results for the Controller gate.")

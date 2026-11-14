@@ -88,4 +88,9 @@ def test_benchmark_turn_command_selects_the_gate_once():
     # The gated Worker starts from the original task; the default profile still plans first.
     entries = {mode: Execution(mode="turn", controller_worker=True, controller_gate=mode,
                                validation_command=check).task_entry for mode in CONTROLLER_GATES}
-    assert entries == {"every-return": "loopx-planned", "evidence": "seeded-todo", "never": "seeded-todo"}
+    assert entries == {"every-return": "loopx-planned", "evidence": "seeded-todo",
+                       "evidence-self": "seeded-todo", "never": "seeded-todo"}
+    # The self-judged arm differs from the Controller-judged one by this single value.
+    self_judged = turn_command(env, Execution(mode="turn", controller_worker=True, controller_gate="evidence-self",
+                                              validation_command=check), "wake-1")
+    assert [a if a != "evidence-self" else "evidence" for a in self_judged] == gated
