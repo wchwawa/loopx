@@ -1,10 +1,12 @@
 """A continuously working Worker; Controller attention only where evidence changes the choice."""
+import http.server
 import json
 import os
 import runpy
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -268,7 +270,8 @@ def test_evidence_command_is_trusted_argv_and_fails_soft(tmp_path):
 
 @pytest.mark.skipif(os.environ.get("LOOPX_TEST_NATIVE_ROLE_HOST") != "1",
                     reason="opt-in installed Codex CLI against a local inference fixture")
-def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
+@pytest.mark.parametrize("entry", ["turn", "benchmark"])
+def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path, entry):
     from tests.control_plane.canonical_authority_fixture import initialize_canonical_source_fixture
     from tests.control_plane.codex_checkpoint_fixture import local_inference_provider
 
@@ -332,6 +335,28 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
         message["content"][0]["text"] = json.dumps(answer)
         return message
 
+    # The benchmark entry reads the solver-visible native history over HTTP instead.
+    class History(http.server.BaseHTTPRequestHandler):
+        reads = 0
+
+        def do_GET(self):
+            History.reads += 1
+            entries = [{"type": "submission", "submission_id": f"s{i}", "round": f"agent-{i}",
+                        "status": "completed", "valid": True, "pass_rate": 1.0, "score": 5.0 if i == 0 else 1.0}
+                       for i in range(1 + 3 * History.reads)]
+            body = json.dumps({"best_score": 5.0, "best_pass_rate": 1.0, "entries": entries}).encode()
+            self.send_response(200 if self.path == "/history" else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    feedback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), History)
+    threading.Thread(target=feedback.serve_forever, daemon=True).start()
+
     binary = shutil.which("codex")
     assert binary, "Install the Codex CLI before enabling native role qualification"
     invocations = tmp_path / "cli-invocations"
@@ -342,6 +367,31 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
                        f"os.execv({binary!r}, [{binary!r}, *args])\n")
     wrapper.chmod(0o700)
     with local_inference_provider(respond) as (url, _, _):
+        if entry == "benchmark":
+            from benchmark.runtime.scheduler import worker_command
+
+            (tmp_path / "skills").mkdir()
+            env = dict(os.environ, HOME=str(tmp_path / "home"), PYTHONPATH=str(src),
+                LOOPX_CLI=str(Path(sys.executable).parent / "loopx"), CODEX_BIN=str(wrapper), MODEL_NAME="gpt-5.4",
+                REASONING_EFFORT="low", OPENAI_BASE_URL=url, OPENAI_API_KEY="fixture", LOOPX_USAGE_PING="0",
+                LOOPX_PROJECT=str(project), LOOPX_RUNTIME_ROOT=str(runtime), LOOPX_REGISTRY=str(registry),
+                LOOPX_GOAL_ID=goal, LOOPX_AGENT_ID=agent, LOOPX_SHARED_SKILLS=str(tmp_path / "skills"),
+                LOOPX_CODEX_HOME=str(tmp_path / "codex"), LOOPX_WAKE_LOG_DIR=str(tmp_path / "logs/wakes"),
+                LOOPX_CODEX_SANDBOX="workspace-write", LOOPX_EXECUTION_MODE="turn", LOOPX_TASK_ENTRY="seeded-todo",
+                LOOPX_TURN_TOPOLOGY="controller-worker", LOOPX_CONTROLLER_GATE="evidence",
+                LOOPX_CODEX_TURN_TIMEOUT_SEC="60", LOOPX_TASK_DOC=str(task),
+                SFORGE_FEEDBACK_URL=f"http://127.0.0.1:{feedback.server_address[1]}",
+                LOOPX_VALIDATION_COMMAND_JSON=json.dumps(fixture["_validator_command"](expected)))
+            cmd = worker_command(env, python=sys.executable, source=str(src),
+                                 state_file=str(tmp_path / "scheduler.json"), host_timeout=90) + ["--once"]
+            completed = subprocess.run(cmd, cwd=project, env=env, timeout=170, capture_output=True, text=True)
+            feedback.shutdown()
+            assert completed.returncode == 0, completed.stdout[-2200:] + completed.stderr[-500:]
+            wake, = (tmp_path / "logs/wakes").iterdir()
+            assert json.loads((wake / "receipt.json").read_text())["turn_execution"]["status"] == "committed"
+            # The Host, not a model, read the native history, and a trial cannot ask an owner for help.
+            assert History.reads >= 2 and calls.exists() is False
+            assert all("needs_help" not in text for text in controller_inputs)
         home = tmp_path / "role-home"
         home.mkdir()
         (home / "config.toml").write_text(
@@ -349,7 +399,8 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
             f'name="local"\nbase_url="{url}"\nwire_api="responses"\nenv_key="OPENAI_API_KEY"\n')
         env = {k: v for k, v in os.environ.items() if not k.startswith("LOOPX_")}
         env.update(CODEX_HOME=str(home), OPENAI_API_KEY="fixture", PYTHONPATH=str(src), LOOPX_USAGE_PING="0")
-        cmd = [sys.executable, "-m", "loopx.cli", "--registry", str(registry), "--runtime-root", str(runtime),
+        cmd = [] if entry == "benchmark" else [
+               sys.executable, "-m", "loopx.cli", "--registry", str(registry), "--runtime-root", str(runtime),
                "--format", "json", "turn", "run-once", "--execute", "--no-global-sync",
                "--goal-id", goal, "--agent-id", agent, "--project", str(project),
                "--host", "codex-cli", "--execution-mode", "isolated-headless", "--topology", "controller-worker",
@@ -359,16 +410,18 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
                "--controller-gate", "evidence", "--role-isolation", "caller",
                "--evidence-command-json", json.dumps([sys.executable, str(evidence)]),
                "--validation-command-json", json.dumps(fixture["_validator_command"](expected))]
-        completed = subprocess.run(cmd, cwd=project, env=env, timeout=150, capture_output=True, text=True)
-        assert completed.returncode == 0, completed.stdout[-2200:] + completed.stderr[-500:]
-        result = json.loads(completed.stdout)
-        assert result["status"] == "committed" and result["host"]["topology"] == "controller-worker"
-        # A different gate is a different admitted configuration.
-        start = cmd.index("--turn-instance-id")
-        changed = cmd[:start] + ["--resume-turn-key", result["resume_turn_key"]] + cmd[start + 2:]
-        changed[changed.index("--controller-gate") + 1] = "never"
-        held = subprocess.run(changed, cwd=project, env=env, capture_output=True, text=True, timeout=30)
-        assert held.returncode != 0 and "original Turn topology" in held.stdout + held.stderr
+        if entry == "turn":
+            feedback.shutdown()
+            completed = subprocess.run(cmd, cwd=project, env=env, timeout=150, capture_output=True, text=True)
+            assert completed.returncode == 0, completed.stdout[-2200:] + completed.stderr[-500:]
+            result = json.loads(completed.stdout)
+            assert result["status"] == "committed" and result["host"]["topology"] == "controller-worker"
+            # A different gate is a different admitted configuration.
+            start = cmd.index("--turn-instance-id")
+            changed = cmd[:start] + ["--resume-turn-key", result["resume_turn_key"]] + cmd[start + 2:]
+            changed[changed.index("--controller-gate") + 1] = "never"
+            held = subprocess.run(changed, cwd=project, env=env, capture_output=True, text=True, timeout=30)
+            assert held.returncode != 0 and "original Turn topology" in held.stdout + held.stderr
 
     # The Worker received the caller's task first, verbatim, with no Controller turn before it.
     assert worker_inputs[0] == TASK
