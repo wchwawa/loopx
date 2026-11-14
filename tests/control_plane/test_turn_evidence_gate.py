@@ -1,4 +1,4 @@
-"""The evidence gate interrupts a working Worker only when measurements change the choice."""
+"""The Host asks for Controller attention only when something new could change the choice."""
 import pytest
 
 from loopx.control_plane.turn_driver import evidence_gate as gate
@@ -6,13 +6,24 @@ from loopx.control_plane.turn_driver import evidence_gate as gate
 POLICY = gate.GatePolicy(plateau_results=3, final_reserve_seconds=60, min_consult_remaining_seconds=300)
 
 
-def snapshot(values, *, higher=True, proxies=()):
+def snapshot(values, *, higher=True, proxies=(), checks=()):
     rows = [{"candidate_ref": f"c{i}", "value": value, "valid": value is not None, "authoritative": True,
              "sequence": i} for i, value in enumerate(values)]
     rows += [{"candidate_ref": ref, "value": value, "valid": True, "authoritative": False, "sequence": 100 + i}
              for i, (ref, value) in enumerate(proxies)]
-    return gate.normalize_evidence({"schema_version": gate.EVIDENCE_SCHEMA, "higher_is_better": higher,
-                                    "measurements": rows})
+    return gate.normalize_evidence({
+        "schema_version": gate.EVIDENCE_SCHEMA, "higher_is_better": higher, "measurements": rows,
+        "checks": [{"check_ref": "independent", "passed": passed, "sequence": i} for i, passed in enumerate(checks)]})
+
+
+def checked(*results):
+    """A task with no score: only independent pass/fail checks."""
+    return gate.normalize_evidence({"schema_version": gate.EVIDENCE_SCHEMA, "checks": [
+        {"check_ref": "independent", "passed": passed, "sequence": i} for i, passed in enumerate(results)]})
+
+
+def returned(state="working", *, seconds=900.0, new=1):
+    return {"elapsed_seconds": seconds, "new_evidence": new, "state": state}
 
 
 def decide(evidence, state, *, mode="evidence", remaining=3600.0, returns=(), fidelity=None):
@@ -89,14 +100,14 @@ def test_modes_bound_controller_attention():
 
 def test_idle_returns_without_evidence_consult_once_per_streak():
     state = {}
-    quick = {"elapsed_seconds": 20.0, "new_measurements": 0}
-    busy = {"elapsed_seconds": 900.0, "new_measurements": 0}
+    quick = {"elapsed_seconds": 20.0, "new_evidence": 0}
+    busy = {"elapsed_seconds": 900.0, "new_evidence": 0}
     assert decide(None, state, returns=[quick]).action == "continue"
     assert decide(None, state, returns=[quick, quick]).reason == "worker_idle"
     assert decide(None, state, returns=[quick, quick, quick]).action == "continue"
     assert decide(None, state, returns=[quick, quick, quick, busy]).action == "continue"
     assert decide(None, state, returns=[quick, quick, quick, busy, quick, quick]).reason == "worker_idle"
-    measured = {"elapsed_seconds": 20.0, "new_measurements": 1}
+    measured = {"elapsed_seconds": 20.0, "new_evidence": 1}
     assert decide(None, {}, returns=[measured, measured]).action == "continue"
 
 
@@ -127,6 +138,58 @@ def test_reversed_proxy_reuses_the_shared_fidelity_operator():
     assert len(calls) == 2
 
 
+def test_a_task_without_score_or_news_lets_the_worker_continue():
+    state = {}
+    working = [returned() for _ in range(6)]
+    for upto in range(1, 7):
+        for evidence in (None, checked(), checked(*[True] * upto)):
+            decision = decide(evidence, state, returns=working[:upto])
+            assert (decision.action, decision.reason) == ("continue", "no_decision_relevant_evidence")
+    assert "authoritative" not in decision.facts and decision.facts["worker_state"] == "working"
+
+
+def test_worker_reported_state_asks_once_then_only_if_it_persists():
+    state = {}
+    history = [returned()]
+    assert decide(None, state, returns=history).action == "continue"
+    history.append(returned("blocked"))
+    first = decide(None, state, returns=history)
+    assert (first.action, first.reason, first.facts["worker_state"]) == ("consult", "worker_blocked", "blocked")
+    history.append(returned("blocked"))
+    assert decide(None, state, returns=history).action == "continue"
+    history.append(returned("blocked"))
+    assert decide(None, state, returns=history).reason == "worker_blocked"
+    # A different statement is new information at once.
+    history.append(returned("assumption_refuted"))
+    assert decide(None, state, returns=history).reason == "assumption_refuted"
+    history += [returned(), returned("assumption_refuted")]
+    assert decide(None, state, returns=history[:-1]).action == "continue"
+    assert decide(None, state, returns=history).reason == "assumption_refuted"
+    # The Worker's own statement outranks a measured stall seen at the same boundary.
+    assert decide(snapshot([5.0, 1.0, 1.0, 1.0]), {}, returns=[returned("blocked")]).reason == "worker_blocked"
+    # An unknown state is not a signal, and the disabled gate ignores every signal.
+    assert decide(None, {}, returns=[{"elapsed_seconds": 900.0, "state": "confused"}]).action == "continue"
+    assert decide(None, {}, mode="never", returns=[returned("blocked")]).reason == "gate_disabled"
+
+
+def test_independent_check_failing_repeatedly_asks_for_attention():
+    state = {}
+    assert decide(checked(True, False), state, returns=[returned()]).action == "continue"
+    failing = decide(checked(True, False, False), state, returns=[returned()])
+    assert (failing.action, failing.reason) == ("consult", "independent_check_failing")
+    assert failing.facts["checks"]["failing_in_a_row"] == 2 and failing.facts["checks"]["count"] == 3
+    # The same failures do not ask again; two more do.
+    assert decide(checked(True, False, False), state, returns=[returned()]).action == "continue"
+    assert decide(checked(True, False, False, False), state, returns=[returned()]).action == "continue"
+    assert decide(checked(True, False, False, False, False), state, returns=[returned()]).action == "consult"
+    # A pass ends the run of failures.
+    assert decide(checked(False, False, True), {}, returns=[returned()]).action == "continue"
+    # Checks and measurements can arrive together; failing checks are judged first.
+    both = decide(snapshot([5.0, 1.0, 1.0, 1.0], checks=[False, False]), {}, returns=[returned()])
+    assert both.reason == "independent_check_failing" and both.facts["authoritative"]["count"] == 4
+    assert gate.evidence_size(snapshot([1.0, 2.0], checks=[True])) == 3 and gate.evidence_size(None) == 0
+
+
 @pytest.mark.parametrize("payload", [
     {"schema_version": "other", "higher_is_better": True, "measurements": []},
     {"schema_version": gate.EVIDENCE_SCHEMA, "higher_is_better": "yes", "measurements": []},
@@ -136,6 +199,11 @@ def test_reversed_proxy_reuses_the_shared_fidelity_operator():
         {"candidate_ref": "a", "value": float("nan"), "valid": True, "authoritative": True, "sequence": 0}]},
     {"schema_version": gate.EVIDENCE_SCHEMA, "higher_is_better": True, "measurements": [
         {"candidate_ref": "a", "value": True, "valid": True, "authoritative": True, "sequence": 0}]},
+    # Measurements need a direction; checks need a typed outcome.
+    {"schema_version": gate.EVIDENCE_SCHEMA, "measurements": [
+        {"candidate_ref": "a", "value": 1.0, "valid": True, "authoritative": True, "sequence": 0}]},
+    {"schema_version": gate.EVIDENCE_SCHEMA, "checks": [{"check_ref": "c", "passed": "no", "sequence": 0}]},
+    {"schema_version": gate.EVIDENCE_SCHEMA, "checks": [{"check_ref": "", "passed": True, "sequence": 0}]},
 ])
 def test_malformed_evidence_is_rejected(payload):
     with pytest.raises(ValueError, match="Worker"):

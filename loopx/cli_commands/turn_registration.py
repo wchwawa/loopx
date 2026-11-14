@@ -185,7 +185,10 @@ def register_turn_commands(
              "working on --task-material until the deadline reserve.")
     run_once.add_argument("--evidence-command-json",
         help="Trusted JSON argv run by the Host after each Worker return; prints a turn_worker_evidence_v0 "
-             "snapshot of measured results for the Controller gate.")
+             "snapshot of independent checks and, for scored tasks, measured results for the Controller gate.")
+    run_once.add_argument("--unattended", action="store_true",
+        help="No owner can answer during this Turn: a consulted Controller may continue or redirect "
+             "the Worker but cannot end the Turn to ask for help.")
     run_once.add_argument("--role-isolation", choices=("workspace", "caller"), default="workspace",
         help="workspace: each role runs in its own nested project sandbox without network. caller: both "
              "roles keep the caller's --codex-sandbox grant and environment with no nested sandbox, for a "

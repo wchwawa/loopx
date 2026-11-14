@@ -28,7 +28,9 @@ from loopx.control_plane.turn_driver.codex_cli import (
 )
 from loopx.control_plane.turn_driver.host_process_transport import HostOutputLines, run_host_process
 from loopx.control_plane.turn_driver.decision_capture import read_turn_observation_text
-from loopx.control_plane.turn_driver.evidence_gate import GATE_MODES, GatePolicy, decide, normalize_evidence
+from loopx.control_plane.turn_driver.evidence_gate import (
+    CONTROLLER_VERDICTS, GATE_MODES, WORKER_STATES, GatePolicy, decide, evidence_size, normalize_evidence,
+)
 from loopx.control_plane.turn_driver.executor import MATERIAL_HOST_RESULT_KINDS
 from loopx.control_plane.turn_driver.host_candidate import extract_turn_work_identity
 from loopx.control_plane.turn_driver.journal_store import turn_journal_path
@@ -46,6 +48,13 @@ def object_schema(fields):
 
 WORK_REPORT = object_schema({"finding": {"type": "string"},
                              "artifacts": {"type": "array", "items": {"type": "string"}}})
+# A continuously working Worker also states its own situation as a typed value,
+# so the Host never has to read its prose to learn that it is stuck.
+GATED_WORK_REPORT = object_schema({**WORK_REPORT["properties"], "state": {
+    "type": "string", "enum": list(WORKER_STATES),
+    "description": ("working: you are still advancing. blocked: you cannot proceed without something outside "
+                    "your reach. assumption_refuted: new evidence overturned the approach you were pursuing."),
+}})
 ROLE_ISOLATIONS = ("workspace", "caller")
 CONTINUE_INSTRUCTION = "Continue working toward the task objective."
 _EVIDENCE_TIMEOUT_SECONDS = 30
@@ -70,10 +79,14 @@ class RoleHost:
     gate: str = "every-return"
     evidence_command: tuple[str, ...] = ()
     role_isolation: str = "workspace"
+    # No owner can answer during this Turn, so the Controller cannot ask for help.
+    unattended: bool = False
 
     def __post_init__(self) -> None:
         if self.gate not in GATE_MODES or self.role_isolation not in ROLE_ISOLATIONS:
             raise ValueError("unknown Controller gate or Worker isolation")
+        if self.unattended and not self.continuous:
+            raise ValueError("an unattended Turn applies to a gated Controller")
         if self.continuous and not self.dispatch_task_material:
             # A continuous Worker starts from the caller's own task text; a
             # Controller-only brief would need a Controller turn before any work.
@@ -403,13 +416,17 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
     """Keep one Worker advancing; spend Controller attention only when the gate asks.
 
     The Worker receives the caller's task verbatim with no Controller turn in
-    front of it. After each Worker return the Host reads measured evidence and
-    decides without a model call. Ordinary returns resume the same Worker
-    thread immediately. A consult gives the Controller the evidence that fired
-    the gate; the deadline reserve asks it for the typed Core result.
+    front of it. After each Worker return the Host decides, without a model
+    call, whether anything new is worth a Controller look: the Worker's typed
+    state, failing independent checks, or measured results where the task has
+    them. Otherwise the same Worker thread resumes immediately. When asked, the
+    Controller answers continue, redirect or needs_help. The deadline reserve
+    asks it for the typed Core result.
     """
     controller_prompt, result_schema = prepare_codex_controller_input(request)
-    consult_schema = object_schema({"instruction": {"type": "string"}})
+    verdicts = [verdict for verdict in CONTROLLER_VERDICTS if verdict != "needs_help" or not host.unattended]
+    consult_schema = object_schema({"verdict": {"type": "string", "enum": verdicts},
+                                    "instruction": {"type": "string"}})
     policy = gate_policy_for(host.timeout)
     returns = trail.setdefault("worker_returns", [])
     decisions = trail.setdefault("gate_decisions", [])
@@ -418,7 +435,7 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
     while True:
         began = clock()
         try:
-            returned = native.send("worker", instruction, WORK_REPORT, reserve=policy.final_reserve_seconds)
+            returned = native.send("worker", instruction, GATED_WORK_REPORT, reserve=policy.final_reserve_seconds)
             failures = 0
         except RuntimeError:
             # A provider or transport fault ends one native turn, not the Turn:
@@ -428,21 +445,23 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
                 raise
             sleep(_WORKER_RETRY_BACKOFF_SECONDS[failures])
             failures += 1
-            returns.append({"elapsed_seconds": round(clock() - began, 3), "new_measurements": 0,
+            returns.append({"elapsed_seconds": round(clock() - began, 3), "new_evidence": 0,
                             "outcome": "retried_after_failure"})
             save()
             instruction = CONTINUE_INSTRUCTION
             continue
         if returned is not None:
             if (not isinstance(returned.get("finding"), str) or not isinstance(returned.get("artifacts"), list)
-                    or not all(isinstance(path, str) for path in returned["artifacts"])):
+                    or not all(isinstance(path, str) for path in returned["artifacts"])
+                    or returned.get("state") not in WORKER_STATES):
                 raise ValueError("worker returned an invalid report")
             report = returned
         evidence, evidence_error = read_evidence(host)
-        count = len(evidence["measurements"]) if evidence is not None else measured
+        count = evidence_size(evidence) if evidence is not None else measured
         returns.append({"elapsed_seconds": round(clock() - began, 3),
-                        "new_measurements": max(0, count - measured),
-                        "outcome": "returned" if returned is not None else "reserve_reached"})
+                        "new_evidence": max(0, count - measured),
+                        "outcome": "returned" if returned is not None else "reserve_reached",
+                        **({"state": returned["state"]} if returned is not None else {})})
         measured = count
         try:
             remaining = native.remaining()
@@ -462,38 +481,57 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
             brief += [controller_prompt, "The Worker already received this task verbatim and has been working on it:",
                       material]
         brief += [("The Turn budget is nearly spent. Return the typed result now." if settle else
-                   "The Host consulted you because measured evidence may change the Worker's direction."),
+                   "The Host consulted you because something new may change what the Worker should do."),
                   "Trigger: " + decision.reason,
-                  "Measured evidence:\n" + json.dumps(decision.facts, ensure_ascii=False, sort_keys=True),
+                  "Facts:\n" + json.dumps(decision.facts, ensure_ascii=False, sort_keys=True),
                   "Latest Worker report:\n" + json.dumps(report, ensure_ascii=False)]
         if host.role_isolation == "caller":
             brief.append("Inspect the workspace read-only. The Worker owns every file change.")
+        receipt = "For your Core receipt:\n" + "\n".join(codex_receipt_instructions())
         if settle:
-            brief.append("For your Core receipt:\n" + "\n".join(codex_receipt_instructions()))
-            result = native.send("controller", "\n".join(brief), result_schema)
+            result = native.send("controller", "\n".join([*brief, receipt]), result_schema)
             if not isinstance(result, dict):
                 raise ValueError("controller returned an invalid result")
             return normalize_codex_result(request, result)
-        brief.append("Judge from the measurements and the workspace whether the Worker is still refining an "
-                     "approach whose measured gains have stalled. If a different approach clearly has more "
-                     'room, set instruction to that redirection, concretely. Otherwise set instruction to '
-                     '"continue". The work continues until the Turn deadline.')
-        # A consult advises the Worker; it never ends the work early and its
-        # own failure never costs the Worker its session.
+        brief.append("Judge from these facts and the workspace. Set verdict to continue when the current "
+                     "direction should proceed unchanged. Set verdict to redirect, with a concrete instruction "
+                     "for the Worker, when its approach has stalled or been refuted and a different one "
+                     "clearly has more room." + ("" if host.unattended else
+                     " Set verdict to needs_help, with the request in instruction, only when progress "
+                     "depends on a decision or access that neither role can obtain.")
+                     + " Leave instruction empty for continue.")
+        # A consult advises the Worker. Its own failure never costs the Worker
+        # its session, and only an explicit request for help ends the work early.
         instruction = CONTINUE_INSTRUCTION
         try:
-            direction = native.send("controller", "\n".join(brief), consult_schema).get("instruction")
+            reply = native.send("controller", "\n".join(brief), consult_schema)
             briefed = True
         except (RuntimeError, ValueError):
             decisions[-1]["controller_outcome"] = "failed"
             continue
-        if not isinstance(direction, str) or not direction.strip() or len(direction) > 16000:
-            decisions[-1]["controller_outcome"] = "invalid"
-        elif direction.strip().lower() == "continue":
+        verdict, direction = reply.get("verdict"), reply.get("instruction")
+        stated = isinstance(direction, str) and bool(direction.strip()) and len(direction) <= 16000
+        if verdict == "continue":
             decisions[-1]["controller_outcome"] = "continued"
-        else:
+        elif verdict == "redirect" and stated:
             decisions[-1]["controller_outcome"] = "redirected"
             instruction = direction
+        elif verdict == "needs_help" and stated and not host.unattended:
+            # The owner's answer is outside this Turn: settle it as a typed stop.
+            try:
+                result = native.send("controller", "\n".join([
+                    "Return the typed result for the help you requested. Use result_kind user_action_required "
+                    "and state in summary exactly what the owner must decide or provide.", receipt]),
+                    result_schema)
+            except (RuntimeError, ValueError):
+                result = None
+            if isinstance(result, dict) and result.get("result_kind") == "user_action_required":
+                decisions[-1]["controller_outcome"] = "help_requested"
+                save()
+                return normalize_codex_result(request, result)
+            decisions[-1]["controller_outcome"] = "invalid"
+        else:
+            decisions[-1]["controller_outcome"] = "invalid"
 
 
 @contextmanager
@@ -643,13 +681,14 @@ def main():
     parser.add_argument("--controller-gate", choices=GATE_MODES, default="every-return")
     parser.add_argument("--evidence-command-json")
     parser.add_argument("--role-isolation", choices=ROLE_ISOLATIONS, default="workspace")
+    parser.add_argument("--unattended", action="store_true")
     args = parser.parse_args()
     home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
     host = RoleHost(args.project.resolve(), args.runtime.resolve(), args.registry.resolve(), home,
                     args.codex_bin, args.model, args.effort, args.sandbox, args.timeout, args.material, args.material_sha256,
                     dispatch_task_material=args.dispatch_task_material, gate=args.controller_gate,
                     evidence_command=parse_evidence_command(args.evidence_command_json),
-                    role_isolation=args.role_isolation)
+                    role_isolation=args.role_isolation, unattended=args.unattended)
     with interrupt_on_stop():
         print(json.dumps(serve(json.load(sys.stdin), host), ensure_ascii=False))
 

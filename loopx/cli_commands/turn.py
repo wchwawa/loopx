@@ -90,6 +90,8 @@ def handle_turn_command(
             raise ValueError("Controller gate, evidence and Worker isolation require controller-worker topology")
         if gated and not getattr(args, "task_material", None):
             raise ValueError("a gated Controller or caller-level Worker requires --task-material")
+        if getattr(args, "unattended", False) and getattr(args, "controller_gate", "every-return") == "every-return":
+            raise ValueError("--unattended applies to a gated Controller")
         if (native_host_runner is not None or native_session_binding_resolver is not None) and (
             args.host != "codex-app-server" or native_host_runner is None or native_session_binding_resolver is None
         ):

@@ -26,9 +26,9 @@ def evidence_of(values):
 class Transport:
     """Charge each Worker turn against one Turn deadline, as the real transport does."""
 
-    def __init__(self, *, budget, turn_seconds, controller=(), fail_worker_calls=()):
+    def __init__(self, *, budget, turn_seconds, controller=(), fail_worker_calls=(), states=()):
         self.now, self.deadline, self.turn_seconds = 0.0, budget, turn_seconds
-        self.controller, self.fail = iter(controller), set(fail_worker_calls)
+        self.controller, self.fail, self.states = iter(controller), set(fail_worker_calls), iter(states)
         self.evidence = {"threads": {}}
         self.worker_prompts, self.controller_prompts, self.schemas = [], [], []
 
@@ -57,13 +57,14 @@ class Transport:
             self.now += budget
             return None
         self.now += self.turn_seconds
-        return {"finding": f"candidate {len(self.worker_prompts)}", "artifacts": ["solver.cc"]}
+        return {"finding": f"candidate {len(self.worker_prompts)}", "artifacts": ["solver.cc"],
+                "state": next(self.states, "working")}
 
 
-def run(native, tmp_path, *, mode, snapshots, timeout=10_000.0, sleeps=None):
+def run(native, tmp_path, *, mode, snapshots, timeout=10_000.0, sleeps=None, unattended=False):
     host = roles.RoleHost(tmp_path, tmp_path / "rt", tmp_path / "reg", tmp_path / "home", "codex", None, "low",
                           "danger-full-access", timeout, dispatch_task_material=True, gate=mode,
-                          role_isolation="caller")
+                          role_isolation="caller", unattended=unattended)
     feed = iter(snapshots)
     trail = {}
     result = roles.run_gated_roles(
@@ -84,7 +85,7 @@ def test_worker_advances_without_controller_until_results_stop_improving(tmp_pat
     scores = [1.0, 2.0, 3.0, 3.0, 2.5, 2.9, 4.0, 5.0]
     snapshots = [(evidence_of(scores[:n]), None) for n in range(1, len(scores) + 1)]
     native = Transport(budget=10_000, turn_seconds=1_000, controller=[
-        {"instruction": "Replace the greedy pass with beam search."}, RECEIPT])
+        {"verdict": "redirect", "instruction": "Replace the greedy pass with beam search."}, RECEIPT])
     result, trail = run(native, tmp_path, mode="evidence", snapshots=snapshots)
 
     assert result == RECEIPT
@@ -101,7 +102,9 @@ def test_worker_advances_without_controller_until_results_stop_improving(tmp_pat
     assert "C1 CONTRACT" not in settle and "Trigger: deadline_reserve" in settle
     assert "For your Core receipt:" in settle
     # A consult can only advise; only the deadline reserve asks for the typed result.
-    assert native.schemas[0]["required"] == ["instruction"] and native.schemas[1] == {"type": "object"}
+    assert native.schemas[0]["required"] == ["verdict", "instruction"]
+    assert native.schemas[0]["properties"]["verdict"]["enum"] == ["continue", "redirect", "needs_help"]
+    assert native.schemas[1] == {"type": "object"}
     assert [(d["action"], d["reason"]) for d in trail["gate_decisions"]] == [
         *[("continue", "no_decision_relevant_evidence")] * 5, ("consult", "authoritative_plateau"),
         *[("continue", "no_decision_relevant_evidence")] * 3, ("finalize", "deadline_reserve")]
@@ -123,7 +126,7 @@ def test_never_mode_spends_one_controller_turn_for_the_receipt(tmp_path):
 def test_controller_may_let_the_worker_proceed_unchanged(tmp_path):
     flat = [(evidence_of([5.0, 1.0, 1.0][:n] + [1.0] * max(0, n - 3)), None) for n in range(1, 9)]
     native = Transport(budget=10_000, turn_seconds=1_500, controller=[
-        {"instruction": "continue"}, RECEIPT])
+        {"verdict": "continue", "instruction": ""}, RECEIPT])
     _, trail = run(native, tmp_path, mode="evidence", snapshots=flat)
     consult = next(d for d in trail["gate_decisions"] if d["action"] == "consult")
     assert consult["controller_outcome"] == "continued"
@@ -134,7 +137,8 @@ def test_a_failed_or_empty_consult_never_costs_the_worker_its_session(tmp_path):
     scores = [5.0] + [1.0] * 12
     snapshots = [(evidence_of(scores[:n]), None) for n in range(1, 10)]
     native = Transport(budget=10_000, turn_seconds=1_000, controller=[
-        RuntimeError("native role Turn did not complete"), {"instruction": "  "}, RECEIPT])
+        RuntimeError("native role Turn did not complete"), {"verdict": "redirect", "instruction": "  "},
+        RECEIPT])
     result, trail = run(native, tmp_path, mode="evidence", snapshots=snapshots)
     assert result == RECEIPT
     outcomes = [d.get("controller_outcome") for d in trail["gate_decisions"] if d["action"] == "consult"]
@@ -144,6 +148,42 @@ def test_a_failed_or_empty_consult_never_costs_the_worker_its_session(tmp_path):
     # A consult that failed before delivery re-sends the contract on the next one.
     assert all(prompt.startswith("C1 CONTRACT") for prompt in native.controller_prompts[:2])
     assert not native.controller_prompts[2].startswith("C1 CONTRACT")
+
+
+def test_blocked_worker_reaches_the_controller_which_may_ask_the_owner_for_help(tmp_path):
+    help_result = {"result_kind": "user_action_required", "summary": "Provide the dataset licence."}
+    native = Transport(budget=10_000, turn_seconds=1_000, states=["working", "blocked"], controller=[
+        {"verdict": "needs_help", "instruction": "The dataset licence is missing."}, help_result])
+    result, trail = run(native, tmp_path, mode="evidence", snapshots=[])
+    assert result == help_result
+    # No score and no check was needed: the Worker's typed state asked for attention.
+    assert [(d["action"], d["reason"]) for d in trail["gate_decisions"]] == [
+        ("continue", "no_decision_relevant_evidence"), ("consult", "worker_blocked")]
+    assert trail["gate_decisions"][-1]["controller_outcome"] == "help_requested"
+    assert [r["state"] for r in trail["worker_returns"]] == ["working", "blocked"]
+    assert len(native.worker_prompts) == 2 and "Trigger: worker_blocked" in native.controller_prompts[0]
+    assert "needs_help" in native.controller_prompts[0] and "user_action_required" in native.controller_prompts[1]
+
+    # Help must settle as the typed owner stop; anything else leaves the Worker working.
+    wrong = Transport(budget=4_000, turn_seconds=1_000, states=["blocked"], controller=[
+        {"verdict": "needs_help", "instruction": "Stuck."}, {"result_kind": "validated_completion"}, RECEIPT])
+    result, trail = run(wrong, tmp_path, mode="evidence", snapshots=[], timeout=4_000.0)
+    assert result == RECEIPT and trail["gate_decisions"][0]["controller_outcome"] == "invalid"
+    assert wrong.worker_prompts[1] == roles.CONTINUE_INSTRUCTION
+
+
+def test_unattended_turn_cannot_end_to_ask_for_help(tmp_path):
+    native = Transport(budget=4_000, turn_seconds=1_000, states=["blocked"], controller=[
+        {"verdict": "needs_help", "instruction": "Stuck."}, RECEIPT])
+    result, trail = run(native, tmp_path, mode="evidence", snapshots=[], timeout=4_000.0, unattended=True)
+    assert result == RECEIPT
+    assert native.schemas[0]["properties"]["verdict"]["enum"] == ["continue", "redirect"]
+    assert "needs_help" not in native.controller_prompts[0]
+    assert trail["gate_decisions"][0]["controller_outcome"] == "invalid"
+    assert set(native.worker_prompts[1:]) == {roles.CONTINUE_INSTRUCTION}
+    with pytest.raises(ValueError, match="unattended"):
+        roles.RoleHost(tmp_path, tmp_path, tmp_path, tmp_path, "codex", None, None, "read-only", 10,
+                       unattended=True)
 
 
 def test_transient_worker_failure_resumes_the_same_thread(tmp_path):
@@ -262,7 +302,7 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
         if last.get("type") == "function_call_output":
             wrote = (project / marker).exists()
             answer = {"finding": "Written" if wrote else "Observed " + expected,
-                      "artifacts": [marker] if wrote else []}
+                      "artifacts": [marker] if wrote else [], "state": "working"}
         else:
             text = [part["text"] for item in request["input"] if item.get("role") == "user"
                     for part in item["content"] if "text" in part][-1]
@@ -271,7 +311,8 @@ def test_real_native_gated_turn_consults_only_on_measured_plateau(tmp_path):
                 if "Turn request:\n" in text:
                     key = json.JSONDecoder().raw_decode(text.split("Turn request:\n", 1)[1])[0]["turn_key"]
                 if "Trigger: deadline_reserve" not in text:
-                    answer = {"instruction": "Copy the checked observation into the output file."}
+                    answer = {"verdict": "redirect",
+                              "instruction": "Copy the checked observation into the output file."}
                 else:
                     answer = {
                         "schema_version": "loopx_turn_result_v0", "turn_key": key,

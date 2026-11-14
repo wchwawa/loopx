@@ -58,6 +58,8 @@ def controller_worker_launch(args, registry: Path, runtime: Path) -> tuple[list[
     isolation = getattr(args, "role_isolation", "workspace")
     if isolation != "workspace":
         argv.extend(["--role-isolation", isolation])
+    if getattr(args, "unattended", False):
+        argv.append("--unattended")
     # The deadline may shrink on recovery. Model, permissions, workspace and
     # private binding paths belong to the original admission.
     home = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())
