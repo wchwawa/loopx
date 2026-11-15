@@ -236,6 +236,32 @@ def test_transient_worker_failure_resumes_the_same_thread(tmp_path):
         run(never_started, tmp_path, mode="never", snapshots=[])
 
 
+def test_failed_worker_turn_repeats_the_input_it_carried(tmp_path):
+    scores = [1.0, 2.0, 3.0, 3.0, 2.5, 2.9, 4.0, 5.0]
+    snapshots = [(evidence_of(scores[:n]), None) for n in range(1, len(scores) + 1)]
+    redirect = "Replace the greedy pass with beam search."
+
+    def repeated(text):
+        return roles.REPEATED_INPUT_NOTICE + "\n" + text
+
+    # The turn that carries the Controller's redirect fails: the retry says it again.
+    native = Transport(budget=10_000, turn_seconds=1_000, fail_worker_calls={7}, controller=[
+        {"verdict": "redirect", "instruction": redirect}, RECEIPT])
+    result, trail = run(native, tmp_path, mode="evidence", snapshots=snapshots)
+    assert result == RECEIPT and trail["gate_decisions"][5]["controller_outcome"] == "redirected"
+    assert native.worker_prompts[6:9] == [redirect, repeated(redirect), roles.CONTINUE_INSTRUCTION]
+
+    # So do facts handed to a Worker that judges itself, through repeated faults, and the task itself.
+    informed = Transport(budget=10_000, turn_seconds=1_000, fail_worker_calls={7, 8}, controller=[RECEIPT])
+    run(informed, tmp_path, mode="evidence-self", snapshots=snapshots)
+    facts = informed.worker_prompts[6]
+    assert facts.startswith(roles.SELF_REVIEW_INSTRUCTION)
+    assert informed.worker_prompts[7:10] == [repeated(facts), repeated(facts), roles.CONTINUE_INSTRUCTION]
+    first = Transport(budget=4_000, turn_seconds=1_000, fail_worker_calls={1}, controller=[RECEIPT])
+    run(first, tmp_path, mode="never", snapshots=[], timeout=4_000.0)
+    assert first.worker_prompts[:3] == [TASK, repeated(TASK), roles.CONTINUE_INSTRUCTION]
+
+
 def test_settlement_requires_a_typed_result(tmp_path):
     native = Transport(budget=1_000, turn_seconds=2_000, controller=[["not", "a", "result"]])
     with pytest.raises(ValueError, match="invalid result"):

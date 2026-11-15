@@ -198,8 +198,10 @@ instruction, leaves the Worker on its own direction and session. Pass
 limited to `continue` and `redirect`. Near the deadline the Host reserves time
 and asks the Controller for the typed result (`deadline_reserve`). A failed
 native Worker turn resumes the same thread with bounded backoff while budget
-remains. Use the default `every-return` gate for bounded work that should
-settle as soon as the Worker finishes.
+remains. The retry repeats the task, redirect or facts that turn carried,
+because the fault may have come before the Worker read them. Use the default
+`every-return` gate for bounded work that should settle as soon as the Worker
+finishes.
 
 **When the Worker judges itself.** `evidence-self` uses the same gate but
 spends no second session. On a signal the Host resumes the Worker thread with

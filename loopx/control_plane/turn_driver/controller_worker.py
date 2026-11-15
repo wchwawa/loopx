@@ -64,6 +64,10 @@ SELF_REVIEW_INSTRUCTION = (
     "what you should do next. Judge from these facts whether your current direction should proceed unchanged, "
     "or whether it has stalled or been refuted and a different approach clearly has more room. Act on that "
     "judgment and keep working toward the task objective.")
+# A failed native turn may have ended before the Worker read what it carried.
+REPEATED_INPUT_NOTICE = (
+    "The previous turn ended on a fault before it finished, so its input is repeated below. "
+    "If you already have it, keep going from where you stopped.")
 _EVIDENCE_TIMEOUT_SECONDS = 30
 _WORKER_RETRY_BACKOFF_SECONDS = (5, 20, 60, 120, 300)
 
@@ -440,12 +444,13 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
     returns = trail.setdefault("worker_returns", [])
     decisions = trail.setdefault("gate_decisions", [])
     gate_state = trail.setdefault("gate_state", {})
-    instruction, briefed, measured, failures, report = material, False, 0, 0, None
+    instruction, briefed, measured, failures, report, repeat = material, False, 0, 0, None, False
     while True:
         began = clock()
         try:
-            returned = native.send("worker", instruction, GATED_WORK_REPORT, reserve=policy.final_reserve_seconds)
-            failures = 0
+            returned = native.send("worker", "\n".join([REPEATED_INPUT_NOTICE, instruction]) if repeat else instruction,
+                                   GATED_WORK_REPORT, reserve=policy.final_reserve_seconds)
+            failures, repeat = 0, False
         except RuntimeError:
             # A provider or transport fault ends one native turn, not the Turn:
             # resume the same thread while the budget still allows useful work.
@@ -457,7 +462,9 @@ def run_gated_roles(native, request, material: str, *, host: RoleHost, save: Cal
             returns.append({"elapsed_seconds": round(clock() - began, 3), "new_evidence": 0,
                             "outcome": "retried_after_failure"})
             save()
-            instruction = CONTINUE_INSTRUCTION
+            # The task, a redirect or reviewed facts must not be lost with the
+            # turn that carried them. Only a plain continuation needs no repeat.
+            repeat = instruction != CONTINUE_INSTRUCTION
             continue
         if returned is not None:
             if (not isinstance(returned.get("finding"), str) or not isinstance(returned.get("artifacts"), list)
